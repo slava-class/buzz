@@ -37,6 +37,16 @@ import type {
   GitBashPrerequisite,
   RuntimeConfigSurface,
 } from "@/shared/api/types";
+import type {
+  RegisterLocalWorldAuthorityInput,
+  RegisterLocalWorldAuthorityResult,
+  ResolvedWorldView,
+  SetWorldViewBindingsInput,
+  SetWorldViewBindingsResult,
+  WorldViewBinding,
+  WorldViewBindingsDocument,
+  WorldViewBindingsResponse,
+} from "@/shared/api/worldViewTypes";
 
 export * from "@/shared/api/tauriChannels";
 
@@ -251,6 +261,26 @@ type RawSetCanvasResult = {
   event_id: string;
 };
 
+type RawWorldViewBindingsResponse = {
+  document: WorldViewBindingsDocument;
+  event_id: string | null;
+  updated_at: number | null;
+  author: string | null;
+};
+
+type RawSetWorldViewBindingsResult = {
+  ok: boolean;
+  event_id: string;
+};
+
+type RawResolvedWorldView = Omit<
+  ResolvedWorldView,
+  "bindingId" | "resolvedAt"
+> & {
+  binding_id: string;
+  resolved_at: string;
+};
+
 /** Error normalized from a rejected Tauri invocation with its wire payload. */
 export class TauriInvokeError extends Error {
   readonly payload: unknown;
@@ -431,6 +461,67 @@ export async function setCanvas(
   return {
     ok: response.ok,
     eventId: response.event_id,
+  };
+}
+
+export async function registerLocalWorldAuthority(
+  input: RegisterLocalWorldAuthorityInput,
+): Promise<RegisterLocalWorldAuthorityResult> {
+  return await invokeTauri<RegisterLocalWorldAuthorityResult>(
+    "register_local_world_authority",
+    {
+      origin: input.origin,
+      mirrorId: input.mirrorId,
+      sourceRoot: input.sourceRoot,
+    },
+  );
+}
+
+export async function getWorldViewBindings(
+  channelId: string,
+): Promise<WorldViewBindingsResponse> {
+  const response = await invokeTauri<RawWorldViewBindingsResponse>(
+    "get_world_view_bindings",
+    { channelId },
+  );
+  return {
+    document: response.document,
+    eventId: response.event_id,
+    updatedAt: response.updated_at,
+    author: response.author,
+  };
+}
+
+export async function setWorldViewBindings(
+  input: SetWorldViewBindingsInput,
+): Promise<SetWorldViewBindingsResult> {
+  const response = await invokeTauri<RawSetWorldViewBindingsResult>(
+    "set_world_view_bindings",
+    {
+      channelId: input.channelId,
+      document: input.document,
+    },
+  );
+  return {
+    ok: response.ok,
+    eventId: response.event_id,
+  };
+}
+
+export async function resolveWorldView(
+  binding: WorldViewBinding,
+): Promise<ResolvedWorldView> {
+  const response = await invokeTauri<RawResolvedWorldView>(
+    "resolve_world_view",
+    { binding },
+  );
+  return {
+    bindingId: response.binding_id,
+    presentation: response.presentation,
+    resolvedAt: response.resolved_at,
+    revision: response.revision,
+    realm: response.realm,
+    view: response.view,
   };
 }
 

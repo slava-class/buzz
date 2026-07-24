@@ -7,6 +7,11 @@ import { parse as yamlParse } from "yaml";
 import { relayClient } from "@/shared/api/relayClient";
 import type { ConnectionState } from "@/shared/api/relayClientShared";
 import type { ChannelTemplate, RelayEvent } from "@/shared/api/types";
+import type {
+  ResolvedWorldView,
+  WorldViewBinding,
+  WorldViewBindingsDocument,
+} from "@/shared/api/worldViewTypes";
 import { getMarkdownParseCount } from "@/shared/ui/markdown/nodeCache";
 import { syncAgentTurnsFromEvents } from "@/features/agents/activeAgentTurnsStore";
 import { recordTimeoutFromRejection } from "@/features/moderation/lib/timeoutStore";
@@ -230,6 +235,8 @@ type E2eConfig = {
     deepHistoryMessageCount?: number;
     feedReadError?: string;
     canvasReadError?: string;
+    worldViewBindings?: WorldViewBindingsDocument;
+    resolvedWorldViews?: Record<string, ResolvedWorldView>;
     /** Delay (ms) for `apply_workspace` so e2e tests can observe the
      *  community-switch gate. 0/undefined = instant. */
     applyCommunityDelayMs?: number;
@@ -10946,6 +10953,52 @@ export function maybeInstallE2eTauriMocks() {
         }
         // Return the no-canvas success shape — content null means no canvas set.
         return { content: null, updated_at: null, author: null };
+      }
+      case "set_world_view_bindings": {
+        const { document } = payload as {
+          document: WorldViewBindingsDocument;
+        };
+        if (activeConfig) {
+          activeConfig.mock ??= {};
+          activeConfig.mock.worldViewBindings = document;
+        }
+        return { ok: true, event_id: mockEventId() };
+      }
+      case "get_world_view_bindings":
+        return {
+          document: activeConfig?.mock?.worldViewBindings ?? {
+            version: 1,
+            bindings: [],
+          },
+          event_id: null,
+          updated_at: null,
+          author: null,
+        };
+      case "resolve_world_view": {
+        const { binding } = payload as { binding: WorldViewBinding };
+        const resolved = activeConfig?.mock?.resolvedWorldViews?.[binding.id];
+        if (!resolved) {
+          throw new Error(
+            `No mocked Shivai world view resolution for ${binding.id}`,
+          );
+        }
+        const { bindingId, resolvedAt, ...result } = resolved;
+        return {
+          ...result,
+          binding_id: bindingId,
+          resolved_at: resolvedAt,
+        };
+      }
+      case "register_local_world_authority": {
+        const authority = payload as {
+          origin: string;
+          mirrorId: string;
+          sourceRoot: string;
+        };
+        return {
+          authority,
+          requiresAgentRestart: true,
+        };
       }
       // ── Local-save archive ──────────────────────────────────────────────
       // These stubs drive the LocalArchiveSettingsCard in screenshot / UI tests

@@ -3714,6 +3714,57 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
     }
 }
 
+fn registered_local_world_writable_roots() -> Vec<String> {
+    use buzz_core::world_view::{
+        LocalWorldAuthorityRegistry, LOCAL_WORLD_AUTHORITY_REGISTRY_FILE_NAME,
+    };
+
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let path = cwd.join(LOCAL_WORLD_AUTHORITY_REGISTRY_FILE_NAME);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "failed to read local world authority registry at agent startup",
+            );
+            return Vec::new();
+        }
+    };
+    let registry: LocalWorldAuthorityRegistry = match serde_json::from_str(&text) {
+        Ok(registry) => registry,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "local world authority registry contains invalid JSON at agent startup",
+            );
+            return Vec::new();
+        }
+    };
+    if let Err(error) = registry.validate() {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "local world authority registry failed validation at agent startup",
+        );
+        return Vec::new();
+    }
+    registry
+        .authorities
+        .into_iter()
+        .filter_map(|authority| {
+            std::path::Path::new(&authority.source_root)
+                .is_dir()
+                .then_some(authority.source_root)
+        })
+        .collect()
+}
+
 struct PoolStartup {
     agents: u32,
     command: String,
@@ -3726,11 +3777,22 @@ struct PoolStartup {
 
 impl PoolStartup {
     fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
+        let mut extra_env = config.persona_env_vars.clone();
+        if config.has_generated_codex_config {
+            let writable_roots = registered_local_world_writable_roots();
+            if !writable_roots.is_empty() {
+                extra_env.push((
+                    acp::LOCAL_WORLD_WRITABLE_ROOTS_ENV.into(),
+                    serde_json::to_string(&writable_roots)
+                        .expect("serializing local world paths cannot fail"),
+                ));
+            }
+        }
         Self {
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
-            extra_env: config.persona_env_vars.clone(),
+            extra_env,
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,

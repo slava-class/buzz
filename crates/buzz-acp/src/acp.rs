@@ -227,6 +227,8 @@ fn deep_merge(
     }
 }
 
+pub(crate) const LOCAL_WORLD_WRITABLE_ROOTS_ENV: &str = "BUZZ_ACP_LOCAL_WORLD_WRITABLE_ROOTS";
+
 /// Build the merged `CODEX_CONFIG` environment-variable value for a Codex agent spawn.
 ///
 /// Returns `Some(json_string)` when `has_generated_codex_config` is true (Buzz injected a
@@ -242,8 +244,8 @@ fn deep_merge(
 /// 3. **Parent-env precedence** — if `parent_codex_config` is `Some`, its keys are
 ///    deep-merged into the result (parent wins on colliding keys at every nesting level;
 ///    unrelated keys from either side survive).
-/// 4. **Forced overlay** — `sandbox_workspace_write.network_access = true` is applied
-///    last so relay access is guaranteed regardless of operator / persona config.
+/// 4. **Forced overlay** — `sandbox_workspace_write.network_access = true` and
+///    registered local-world `writable_roots` are applied last.
 ///
 /// When `has_generated_codex_config` is false, the function returns `None` and the
 /// caller handles any persona-supplied `CODEX_CONFIG` with ordinary operator-wins
@@ -263,6 +265,29 @@ pub(crate) fn build_codex_config_env(
     // Any persona CODEX_CONFIG is handled by the caller with operator-wins semantics.
     if !has_generated_codex_config {
         return Ok(None);
+    }
+
+    let mut local_world_writable_roots = Vec::new();
+    for raw in extra_env
+        .iter()
+        .filter(|(key, _)| key == LOCAL_WORLD_WRITABLE_ROOTS_ENV)
+        .map(|(_, value)| value)
+    {
+        let roots: Vec<String> = serde_json::from_str(raw).map_err(|error| {
+            AcpError::Protocol(format!(
+                "{LOCAL_WORLD_WRITABLE_ROOTS_ENV} must be a JSON string array: {error}"
+            ))
+        })?;
+        for root in roots {
+            if !std::path::Path::new(&root).is_absolute() {
+                return Err(AcpError::Protocol(format!(
+                    "{LOCAL_WORLD_WRITABLE_ROOTS_ENV} contains a non-absolute path"
+                )));
+            }
+            if !local_world_writable_roots.contains(&root) {
+                local_world_writable_roots.push(root);
+            }
+        }
     }
 
     // Collect all CODEX_CONFIG entries from extra_env in order.
@@ -331,6 +356,29 @@ pub(crate) fn build_codex_config_env(
     match sws_entry {
         serde_json::Value::Object(sws_obj) => {
             sws_obj.insert("network_access".to_string(), serde_json::Value::Bool(true));
+            if !local_world_writable_roots.is_empty() {
+                let writable_roots = sws_obj
+                    .entry("writable_roots")
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                let serde_json::Value::Array(existing_roots) = writable_roots else {
+                    return Err(AcpError::Protocol(
+                        "CODEX_CONFIG sandbox_workspace_write.writable_roots is not an array"
+                            .into(),
+                    ));
+                };
+                if existing_roots.iter().any(|root| !root.is_string()) {
+                    return Err(AcpError::Protocol(
+                        "CODEX_CONFIG sandbox_workspace_write.writable_roots must contain only strings"
+                            .into(),
+                    ));
+                }
+                for root in local_world_writable_roots {
+                    let root = serde_json::Value::String(root);
+                    if !existing_roots.contains(&root) {
+                        existing_roots.push(root);
+                    }
+                }
+            }
         }
         other => {
             return Err(AcpError::Protocol(format!(
@@ -3565,6 +3613,27 @@ mod tests {
         let merged = build_codex_config_env(&extra, None, true).unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(v["sandbox_workspace_write"]["network_access"], true);
+    }
+
+    #[test]
+    fn build_codex_config_env_adds_registered_world_roots_after_parent_merge() {
+        let extra = env(&[
+            ("CODEX_CONFIG", GENERATED),
+            (
+                LOCAL_WORLD_WRITABLE_ROOTS_ENV,
+                r#"["/worlds/delivery.world"]"#,
+            ),
+        ]);
+        let parent = r#"{"sandbox_workspace_write":{"writable_roots":["/operator/root"]}}"#;
+        let merged = build_codex_config_env(&extra, Some(parent), true)
+            .unwrap()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(
+            value["sandbox_workspace_write"]["writable_roots"],
+            serde_json::json!(["/operator/root", "/worlds/delivery.world"])
+        );
     }
 
     #[test]

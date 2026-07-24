@@ -5,19 +5,20 @@
 
 use buzz_core::{
     kind::{
-        KIND_AGENT_OBSERVER_FRAME, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_DELETION,
-        KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET, KIND_GIT_ISSUE, KIND_GIT_PATCH,
-        KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
+        KIND_AGENT_OBSERVER_FRAME, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_CANVAS,
+        KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET, KIND_GIT_ISSUE,
+        KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_WORKFLOW_DEF,
-        KIND_WORKFLOW_TRIGGER,
+        KIND_WORKFLOW_TRIGGER, KIND_WORLD_VIEW_BINDINGS,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
         OBSERVER_FRAME_TELEMETRY,
     },
+    world_view::WorldViewBindingsDocument,
 };
 use nostr::{EventBuilder, Kind, Tag};
 use uuid::Uuid;
@@ -528,7 +529,21 @@ pub fn build_custom_emoji_set(emojis: &[CustomEmoji]) -> Result<EventBuilder, Sd
 /// Build a canvas update event (kind 40100).
 pub fn build_set_canvas(channel_id: Uuid, content: &str) -> Result<EventBuilder, SdkError> {
     let tags = vec![tag(&["h", &channel_id.to_string()])?];
-    Ok(EventBuilder::new(Kind::Custom(40100), content).tags(tags))
+    Ok(EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), content).tags(tags))
+}
+
+/// Build a channel world-view bindings update event (kind 40101).
+pub fn build_set_world_view_bindings(
+    channel_id: Uuid,
+    document: &WorldViewBindingsDocument,
+) -> Result<EventBuilder, SdkError> {
+    document.validate().map_err(SdkError::InvalidInput)?;
+    let content = serde_json::to_string(document).map_err(|error| {
+        SdkError::InvalidInput(format!("serialize world view bindings: {error}"))
+    })?;
+    check_content(&content, 64 * 1024)?;
+    let tags = vec![tag(&["h", &channel_id.to_string()])?];
+    Ok(EventBuilder::new(Kind::Custom(KIND_WORLD_VIEW_BINDINGS as u16), content).tags(tags))
 }
 
 /// Build a NIP-01 profile metadata event (kind 0).
@@ -2314,6 +2329,37 @@ mod tests {
         assert_eq!(ev.kind.as_u16(), 40100);
         assert!(has_tag(&ev, "h", &cid.to_string()));
         assert_eq!(ev.content, "# Canvas\nHello");
+    }
+
+    #[test]
+    fn set_world_view_bindings_happy_path() {
+        use buzz_core::world_view::{
+            WorldViewBinding, WorldViewBindingsDocument, WorldViewDisplayMode, WorldViewReference,
+            WORLD_VIEW_BINDINGS_VERSION,
+        };
+
+        let cid = uuid();
+        let document = WorldViewBindingsDocument {
+            version: WORLD_VIEW_BINDINGS_VERSION,
+            bindings: vec![WorldViewBinding {
+                id: Uuid::nil(),
+                label: Some("Launch".into()),
+                reference: WorldViewReference::HostedWorldViewExport {
+                    origin: "https://manifest.shivai.space".into(),
+                    share_token: "view-token".into(),
+                },
+                realm_qualified_name: "world::main".into(),
+                view_qualified_name: "world::main::@Board".into(),
+                display_mode: WorldViewDisplayMode::Graph,
+            }],
+        };
+        let ev = sign(build_set_world_view_bindings(cid, &document).unwrap());
+        assert_eq!(ev.kind.as_u16(), KIND_WORLD_VIEW_BINDINGS as u16);
+        assert!(has_tag(&ev, "h", &cid.to_string()));
+        assert_eq!(
+            serde_json::from_str::<WorldViewBindingsDocument>(&ev.content).unwrap(),
+            document
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ import {
   createChannel,
   deleteChannel,
   getCanvas,
+  getWorldViewBindings,
   getChannelDetails,
   getChannelMembers,
   getChannels,
@@ -15,7 +16,10 @@ import {
   leaveChannel,
   openDm,
   removeChannelMember,
+  registerLocalWorldAuthority,
+  resolveWorldView,
   setCanvas,
+  setWorldViewBindings,
   setChannelPurpose,
   setChannelTopic,
   unarchiveChannel,
@@ -31,6 +35,11 @@ import type {
   SetChannelTopicInput,
   UpdateChannelInput,
 } from "@/shared/api/types";
+import type {
+  RegisterLocalWorldAuthorityInput,
+  WorldViewBinding,
+  WorldViewBindingsDocument,
+} from "@/shared/api/worldViewTypes";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
   readChannelSnapshot,
@@ -655,5 +664,62 @@ export function useSetCanvasMutation(channelId: string | null) {
         });
       }
     },
+  });
+}
+
+// ── Shivai world views ───────────────────────────────────────────────────────
+
+export function useWorldViewBindingsQuery(
+  channelId: string | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ["channel-world-view-bindings", channelId],
+    queryFn: () => {
+      if (!channelId) {
+        return Promise.reject(new Error("No channel selected"));
+      }
+      return getWorldViewBindings(channelId);
+    },
+    enabled: enabled && channelId !== null,
+  });
+}
+
+export function useRegisterLocalWorldAuthorityMutation() {
+  return useMutation({
+    mutationFn: (input: RegisterLocalWorldAuthorityInput) =>
+      registerLocalWorldAuthority(input),
+  });
+}
+
+export function useSetWorldViewBindingsMutation(channelId: string | null) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (document: WorldViewBindingsDocument) => {
+      if (!channelId) {
+        return Promise.reject(new Error("No channel selected"));
+      }
+      return setWorldViewBindings({ channelId, document });
+    },
+    onSuccess: () => {
+      if (channelId) {
+        void queryClient.invalidateQueries({
+          queryKey: ["channel-world-view-bindings", channelId],
+        });
+      }
+    },
+  });
+}
+
+export function useResolvedWorldViewQuery(
+  binding: WorldViewBinding,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ["resolved-world-view", binding],
+    queryFn: () => resolveWorldView(binding),
+    enabled,
+    refetchInterval: 10_000,
   });
 }

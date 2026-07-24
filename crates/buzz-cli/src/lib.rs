@@ -185,6 +185,9 @@ enum Cmd {
     /// Get and set channel canvas documents
     #[command(subcommand)]
     Canvas(CanvasCmd),
+    /// Bind, inspect, and resolve Shivai world views for channels
+    #[command(subcommand, name = "world-views")]
+    WorldViews(WorldViewsCmd),
     /// Add, remove, and list emoji reactions
     #[command(subcommand)]
     Reactions(ReactionsCmd),
@@ -691,6 +694,34 @@ pub enum CanvasCmd {
         /// Canvas content (markdown; use '-' to read from stdin)
         #[arg(long)]
         content: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorldViewsCmd {
+    /// Get the ordered world view bindings document for a channel
+    Get {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+    },
+    /// Replace the ordered world view bindings document for a channel
+    Set {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Versioned bindings JSON (use '-' to read from stdin)
+        #[arg(long)]
+        document: String,
+    },
+    /// Resolve one binding into current normalized Shivai presentation JSON
+    Resolve {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Binding UUID; optional only when the channel has exactly one binding
+        #[arg(long)]
+        binding: Option<String>,
     },
 }
 
@@ -1772,6 +1803,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Messages(sub) => commands::messages::dispatch(sub, &client, &cli.format).await,
         Cmd::Channels(sub) => commands::channels::dispatch(sub, &client, &cli.format).await,
         Cmd::Canvas(sub) => commands::channels::dispatch_canvas(sub, &client).await,
+        Cmd::WorldViews(sub) => commands::world_views::dispatch(sub, &client).await,
         Cmd::Reactions(sub) => commands::reactions::dispatch(sub, &client).await,
         Cmd::Emoji(sub) => commands::emoji::dispatch(sub, &client).await,
         Cmd::Dms(sub) => commands::dms::dispatch(sub, &client).await,
@@ -1827,6 +1859,7 @@ mod tests {
             "upload",
             "users",
             "workflows",
+            "world-views",
         ];
 
         let cmd = Cli::command();

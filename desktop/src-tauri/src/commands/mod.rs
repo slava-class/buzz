@@ -23,6 +23,7 @@ mod identity;
 mod identity_archive;
 mod legacy_storage;
 mod link_preview;
+mod local_world_authorities;
 pub(crate) mod media;
 mod media_animated;
 mod media_download;
@@ -58,6 +59,7 @@ mod window_chrome;
 mod window_vibrancy;
 mod workflows;
 mod workspace;
+mod world_views;
 
 pub use agent_auth::*;
 pub use agent_config::*;
@@ -80,6 +82,7 @@ pub use identity::*;
 pub use identity_archive::*;
 pub use legacy_storage::*;
 pub use link_preview::*;
+pub use local_world_authorities::*;
 pub use media::*;
 pub use media_download::*;
 #[cfg(feature = "mesh-llm")]
@@ -108,3 +111,4 @@ pub use window_chrome::*;
 pub use window_vibrancy::*;
 pub use workflows::*;
 pub use workspace::*;
+pub use world_views::*;

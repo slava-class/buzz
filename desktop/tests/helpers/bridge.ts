@@ -1,5 +1,9 @@
 import type { Page } from "@playwright/test";
-import type { ChannelTemplate } from "../../src/shared/api/types";
+import type {
+  ChannelTemplate,
+  ResolvedWorldView,
+  WorldViewBindingsDocument,
+} from "../../src/shared/api/types";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
 export const TEST_IDENTITIES = {
@@ -233,6 +237,8 @@ type MockBridgeOptions = {
   deepHistoryMessageCount?: number;
   feedReadError?: string;
   canvasReadError?: string;
+  worldViewBindings?: WorldViewBindingsDocument;
+  resolvedWorldViews?: Record<string, ResolvedWorldView>;
   /** Delay (ms) for `apply_workspace`; see e2eBridge mock config. */
   applyCommunityDelayMs?: number;
   openDmDelayMs?: number;
