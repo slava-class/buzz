@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
-import type { ResolvedWorldView } from "../../src/shared/api/types";
+import type { ResolvedWorldView } from "../../src/shared/api/worldViewTypes";
 import { installMockBridge } from "../helpers/bridge";
 
 const SEEDED_BINDING_ID = "11111111-1111-4111-8111-111111111111";

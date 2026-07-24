@@ -3,7 +3,7 @@ import type {
   ChannelTemplate,
   ResolvedWorldView,
   WorldViewBindingsDocument,
-} from "../../src/shared/api/types";
+} from "../../src/shared/api/worldViewTypes";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
 export const TEST_IDENTITIES = {
