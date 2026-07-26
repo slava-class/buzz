@@ -532,9 +532,10 @@ pub fn build_set_canvas(channel_id: Uuid, content: &str) -> Result<EventBuilder,
     Ok(EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), content).tags(tags))
 }
 
-/// Build a channel world-view bindings update event (kind 40101).
+/// Build an optimistic, exact-scope world-view bindings event (kind 40101).
 pub fn build_set_world_view_bindings(
     channel_id: Uuid,
+    expected_revision_event_id: Option<&str>,
     document: &WorldViewBindingsDocument,
 ) -> Result<EventBuilder, SdkError> {
     document.validate().map_err(SdkError::InvalidInput)?;
@@ -542,7 +543,20 @@ pub fn build_set_world_view_bindings(
         SdkError::InvalidInput(format!("serialize world view bindings: {error}"))
     })?;
     check_content(&content, 64 * 1024)?;
-    let tags = vec![tag(&["h", &channel_id.to_string()])?];
+
+    let previous = expected_revision_event_id
+        .map(|event_id| check_hex_exact(event_id, 64, "expected revision event id"))
+        .transpose()?
+        .unwrap_or_default();
+    let d_tag = document.scope.d_tag();
+    let mut tags = vec![
+        tag(&["h", &channel_id.to_string()])?,
+        tag(&["d", &d_tag])?,
+        tag(&["prev", &previous])?,
+    ];
+    if let Some(thread_root_event_id) = document.scope.thread_root_event_id() {
+        tags.push(tag(&["e", thread_root_event_id, "", "root"])?);
+    }
     Ok(EventBuilder::new(Kind::Custom(KIND_WORLD_VIEW_BINDINGS as u16), content).tags(tags))
 }
 
@@ -2334,13 +2348,14 @@ mod tests {
     #[test]
     fn set_world_view_bindings_happy_path() {
         use buzz_core::world_view::{
-            WorldViewBinding, WorldViewBindingsDocument, WorldViewDisplayMode, WorldViewReference,
-            WORLD_VIEW_BINDINGS_VERSION,
+            WorldViewBinding, WorldViewBindingScope, WorldViewBindingsDocument,
+            WorldViewDisplayMode, WorldViewReference, WORLD_VIEW_BINDINGS_VERSION,
         };
 
         let cid = uuid();
-        let document = WorldViewBindingsDocument {
+        let mut document = WorldViewBindingsDocument {
             version: WORLD_VIEW_BINDINGS_VERSION,
+            scope: WorldViewBindingScope::Channel,
             bindings: vec![WorldViewBinding {
                 id: Uuid::nil(),
                 label: Some("Launch".into()),
@@ -2353,13 +2368,35 @@ mod tests {
                 display_mode: WorldViewDisplayMode::Graph,
             }],
         };
-        let ev = sign(build_set_world_view_bindings(cid, &document).unwrap());
+        let ev = sign(build_set_world_view_bindings(cid, None, &document).unwrap());
         assert_eq!(ev.kind.as_u16(), KIND_WORLD_VIEW_BINDINGS as u16);
         assert!(has_tag(&ev, "h", &cid.to_string()));
+        assert!(has_tag(&ev, "d", "world-view-bindings:channel"));
+        assert!(has_tag(&ev, "prev", ""));
         assert_eq!(
             serde_json::from_str::<WorldViewBindingsDocument>(&ev.content).unwrap(),
             document
         );
+
+        let root = "a".repeat(64);
+        let previous = "b".repeat(64);
+        document.scope = WorldViewBindingScope::thread(root.clone()).unwrap();
+        let thread_event =
+            sign(build_set_world_view_bindings(cid, Some(&previous), &document).unwrap());
+        assert!(has_tag(
+            &thread_event,
+            "d",
+            format!("world-view-bindings:thread:{root}").as_str()
+        ));
+        assert!(has_tag(&thread_event, "prev", &previous));
+        assert!(thread_event.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.len() == 4
+                && parts[0] == "e"
+                && parts[1] == root
+                && parts[2].is_empty()
+                && parts[3] == "root"
+        }));
     }
 
     #[test]

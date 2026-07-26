@@ -736,6 +736,7 @@ pub fn run() {
             set_canvas,
             register_local_world_authority,
             get_world_view_bindings,
+            get_effective_world_view_bindings,
             set_world_view_bindings,
             resolve_world_view,
             get_feed,

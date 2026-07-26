@@ -52,7 +52,6 @@ pub fn register_local_world_authority(
 
     Ok(serde_json::json!({
         "authority": authority,
-        "requiresAgentRestart": true,
     }))
 }
 

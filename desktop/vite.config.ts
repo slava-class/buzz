@@ -1,10 +1,12 @@
 import path from "node:path";
-import { defineConfig } from "vite";
+import { defineConfig, searchForWorkspaceRoot } from "vite";
 import react from "@vitejs/plugin-react";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+
+const shivaiWorkspaceRoot = path.resolve(__dirname, "../../shivai");
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -39,6 +41,9 @@ export default defineConfig(async () => ({
     port: parseInt(process.env.VITE_PORT || "1420", 10),
     strictPort: true,
     host: host || false,
+    fs: {
+      allow: [searchForWorkspaceRoot(__dirname), shivaiWorkspaceRoot],
+    },
     hmr: host
       ? {
           protocol: "ws",

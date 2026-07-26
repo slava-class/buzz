@@ -9,8 +9,8 @@ import type { ConnectionState } from "@/shared/api/relayClientShared";
 import type { ChannelTemplate, RelayEvent } from "@/shared/api/types";
 import type {
   ResolvedWorldView,
-  WorldViewBinding,
   WorldViewBindingsDocument,
+  WorldViewResolutionRequest,
 } from "@/shared/api/worldViewTypes";
 import { getMarkdownParseCount } from "@/shared/ui/markdown/nodeCache";
 import { syncAgentTurnsFromEvents } from "@/features/agents/activeAgentTurnsStore";
@@ -236,6 +236,7 @@ type E2eConfig = {
     feedReadError?: string;
     canvasReadError?: string;
     worldViewBindings?: WorldViewBindingsDocument;
+    worldViewThreadBindings?: Record<string, WorldViewBindingsDocument>;
     resolvedWorldViews?: Record<string, ResolvedWorldView>;
     /** Delay (ms) for `apply_workspace` so e2e tests can observe the
      *  community-switch gate. 0/undefined = instant. */
@@ -10960,34 +10961,116 @@ export function maybeInstallE2eTauriMocks() {
         };
         if (activeConfig) {
           activeConfig.mock ??= {};
-          activeConfig.mock.worldViewBindings = document;
+          if (document.scope.kind === "thread") {
+            activeConfig.mock.worldViewThreadBindings = {
+              ...activeConfig.mock.worldViewThreadBindings,
+              [document.scope.threadRootEventId]: document,
+            };
+          } else {
+            activeConfig.mock.worldViewBindings = document;
+          }
         }
-        return { ok: true, event_id: mockEventId() };
-      }
-      case "get_world_view_bindings":
         return {
-          document: activeConfig?.mock?.worldViewBindings ?? {
-            version: 1,
-            bindings: [],
-          },
-          event_id: null,
-          updated_at: null,
-          author: null,
+          ok: true,
+          revisionEventId: mockEventId(),
+          nextReadCommand: "buzz world-views get --channel mock-channel",
         };
+      }
+      case "get_world_view_bindings": {
+        const { threadRootEventId } = payload as {
+          threadRootEventId: string | null;
+        };
+        const document = threadRootEventId
+          ? (activeConfig?.mock?.worldViewThreadBindings?.[
+              threadRootEventId
+            ] ?? {
+              version: 2,
+              scope: {
+                kind: "thread" as const,
+                threadRootEventId,
+              },
+              bindings: [],
+            })
+          : (activeConfig?.mock?.worldViewBindings ?? {
+              version: 2,
+              scope: { kind: "channel" as const },
+              bindings: [],
+            });
+        return {
+          document,
+          revisionEventId: document.bindings.length > 0 ? "1".repeat(64) : null,
+          updatedAt: null,
+          author: null,
+          nextReadCommand: "buzz world-views get --channel mock-channel",
+        };
+      }
+      case "get_effective_world_view_bindings": {
+        const { threadRootEventId } = payload as {
+          threadRootEventId: string | null;
+        };
+        // The long-lived E2E fixtures predate production's 64-hex Nostr ID
+        // decoder and intentionally use readable IDs. Normalize only the mock
+        // response boundary; production inputs remain strict.
+        const effectiveThreadScope = threadRootEventId
+          ? {
+              kind: "thread" as const,
+              threadRootEventId: /^[0-9a-f]{64}$/.test(threadRootEventId)
+                ? threadRootEventId
+                : "f".repeat(64),
+            }
+          : null;
+        const channelDocument = activeConfig?.mock?.worldViewBindings ?? {
+          version: 2,
+          scope: { kind: "channel" as const },
+          bindings: [],
+        };
+        const threadDocument = threadRootEventId
+          ? activeConfig?.mock?.worldViewThreadBindings?.[threadRootEventId]
+          : undefined;
+        const threadBindingIds = new Set(
+          threadDocument?.bindings.map((binding) => binding.id) ?? [],
+        );
+        const channelBindings = channelDocument.bindings
+          .filter((binding) => !threadBindingIds.has(binding.id))
+          .map((binding) => ({
+            binding,
+            declaredScope: channelDocument.scope,
+            bindingRevisionEventId: "1".repeat(64),
+          }));
+        const threadBindings =
+          threadDocument?.bindings.map((binding) => ({
+            binding,
+            declaredScope: effectiveThreadScope ?? threadDocument.scope,
+            bindingRevisionEventId: "2".repeat(64),
+          })) ?? [];
+        return {
+          effectiveScope:
+            effectiveThreadScope ?? ({ kind: "channel" } as const),
+          bindings: [...channelBindings, ...threadBindings],
+          channelRevisionEventId:
+            channelDocument.bindings.length > 0 ? "1".repeat(64) : null,
+          threadRevisionEventId:
+            threadDocument && threadDocument.bindings.length > 0
+              ? "2".repeat(64)
+              : null,
+          nextReadCommands: [
+            "buzz world-views get --channel mock-channel",
+            "buzz world-views resolve --channel mock-channel",
+          ],
+        };
+      }
       case "resolve_world_view": {
-        const { binding } = payload as { binding: WorldViewBinding };
-        const resolved = activeConfig?.mock?.resolvedWorldViews?.[binding.id];
+        const { request } = payload as {
+          request: WorldViewResolutionRequest;
+        };
+        const resolved =
+          activeConfig?.mock?.resolvedWorldViews?.[request.binding.id];
         if (!resolved) {
           throw new Error(
-            `No mocked Shivai world view resolution for ${binding.id}`,
+            `No mocked Shivai world view resolution for ${request.binding.id}`,
           );
         }
-        const { bindingId, resolvedAt, ...result } = resolved;
-        return {
-          ...result,
-          binding_id: bindingId,
-          resolved_at: resolvedAt,
-        };
+        return resolved;
       }
       case "register_local_world_authority": {
         const authority = payload as {
@@ -10997,7 +11080,6 @@ export function maybeInstallE2eTauriMocks() {
         };
         return {
           authority,
-          requiresAgentRestart: true,
         };
       }
       // ── Local-save archive ──────────────────────────────────────────────

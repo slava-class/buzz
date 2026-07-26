@@ -704,6 +704,9 @@ pub enum WorldViewsCmd {
         /// Channel UUID
         #[arg(long)]
         channel: String,
+        /// Exact thread-root event id; omit for channel declarations
+        #[arg(long)]
+        thread_root: Option<String>,
     },
     /// Replace the ordered world view bindings document for a channel
     Set {
@@ -713,12 +716,18 @@ pub enum WorldViewsCmd {
         /// Versioned bindings JSON (use '-' to read from stdin)
         #[arg(long)]
         document: String,
+        /// Current event revision, or the literal `none` for first creation
+        #[arg(long)]
+        expected_revision: String,
     },
     /// Resolve one binding into current normalized Shivai presentation JSON
     Resolve {
         /// Channel UUID
         #[arg(long)]
         channel: String,
+        /// Exact thread-root event id; omit to resolve channel declarations
+        #[arg(long)]
+        thread_root: Option<String>,
         /// Binding UUID; optional only when the channel has exactly one binding
         #[arg(long)]
         binding: Option<String>,

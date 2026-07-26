@@ -7,6 +7,7 @@ import {
   createChannel,
   deleteChannel,
   getCanvas,
+  getEffectiveWorldViewBindings,
   getWorldViewBindings,
   getChannelDetails,
   getChannelMembers,
@@ -25,6 +26,8 @@ import {
   unarchiveChannel,
   updateChannel,
 } from "@/shared/api/tauri";
+import { relayClient } from "@/shared/api/relayClient";
+import { KIND_WORLD_VIEW_BINDINGS } from "@/shared/constants/kinds";
 import type {
   AddChannelMembersInput,
   Channel,
@@ -37,8 +40,9 @@ import type {
 } from "@/shared/api/types";
 import type {
   RegisterLocalWorldAuthorityInput,
-  WorldViewBinding,
-  WorldViewBindingsDocument,
+  SetWorldViewBindingsInput,
+  WorldViewBindingScope,
+  WorldViewResolutionRequest,
 } from "@/shared/api/worldViewTypes";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
@@ -671,15 +675,89 @@ export function useSetCanvasMutation(channelId: string | null) {
 
 export function useWorldViewBindingsQuery(
   channelId: string | null,
+  scope: WorldViewBindingScope = { kind: "channel" },
   enabled = true,
 ) {
+  const threadRootEventId =
+    scope.kind === "thread" ? scope.threadRootEventId : null;
   return useQuery({
-    queryKey: ["channel-world-view-bindings", channelId],
+    queryKey: ["channel-world-view-bindings", channelId, threadRootEventId],
     queryFn: () => {
       if (!channelId) {
         return Promise.reject(new Error("No channel selected"));
       }
-      return getWorldViewBindings(channelId);
+      return getWorldViewBindings(channelId, threadRootEventId);
+    },
+    enabled: enabled && channelId !== null,
+  });
+}
+
+export function useLiveWorldViewBindingUpdates(channelId: string | null): void {
+  const queryClient = useQueryClient();
+
+  React.useEffect(() => {
+    if (!channelId) return;
+
+    let cancelled = false;
+    let disposeLive: (() => Promise<void>) | null = null;
+    const invalidate = () => {
+      void queryClient.invalidateQueries({
+        queryKey: ["channel-world-view-bindings", channelId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["effective-channel-world-view-bindings", channelId],
+      });
+    };
+    const disposeReconnect = relayClient.subscribeToReconnects(invalidate);
+    void relayClient
+      .subscribeLive(
+        {
+          kinds: [KIND_WORLD_VIEW_BINDINGS],
+          "#h": [channelId],
+          limit: 0,
+        },
+        invalidate,
+      )
+      .then((dispose) => {
+        if (cancelled) {
+          void dispose();
+        } else {
+          disposeLive = dispose;
+        }
+      })
+      .catch((error: unknown) => {
+        console.error(
+          "Failed to subscribe to world-view binding updates",
+          error,
+        );
+      });
+
+    return () => {
+      cancelled = true;
+      disposeReconnect();
+      if (disposeLive) {
+        void disposeLive();
+      }
+    };
+  }, [channelId, queryClient]);
+}
+
+export function useEffectiveWorldViewBindingsQuery(
+  channelId: string | null,
+  threadRootEventId: string | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "effective-channel-world-view-bindings",
+      channelId,
+      threadRootEventId,
+    ],
+    queryFn: () => {
+      if (!channelId) {
+        return Promise.reject(new Error("No channel selected"));
+      }
+      return getEffectiveWorldViewBindings(channelId, threadRootEventId);
     },
     enabled: enabled && channelId !== null,
   });
@@ -696,16 +774,32 @@ export function useSetWorldViewBindingsMutation(channelId: string | null) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (document: WorldViewBindingsDocument) => {
+    mutationFn: (
+      input: Pick<
+        SetWorldViewBindingsInput,
+        "document" | "expectedRevisionEventId"
+      >,
+    ) => {
       if (!channelId) {
         return Promise.reject(new Error("No channel selected"));
       }
-      return setWorldViewBindings({ channelId, document });
+      return setWorldViewBindings({ channelId, ...input });
     },
-    onSuccess: () => {
+    onSuccess: (_result, input) => {
       if (channelId) {
+        const threadRootEventId =
+          input.document.scope.kind === "thread"
+            ? input.document.scope.threadRootEventId
+            : null;
         void queryClient.invalidateQueries({
-          queryKey: ["channel-world-view-bindings", channelId],
+          queryKey: [
+            "channel-world-view-bindings",
+            channelId,
+            threadRootEventId,
+          ],
+        });
+        void queryClient.invalidateQueries({
+          queryKey: ["effective-channel-world-view-bindings", channelId],
         });
       }
     },
@@ -713,13 +807,21 @@ export function useSetWorldViewBindingsMutation(channelId: string | null) {
 }
 
 export function useResolvedWorldViewQuery(
-  binding: WorldViewBinding,
+  request: WorldViewResolutionRequest | null,
   enabled = true,
 ) {
   return useQuery({
-    queryKey: ["resolved-world-view", binding],
-    queryFn: () => resolveWorldView(binding),
-    enabled,
-    refetchInterval: 10_000,
+    queryKey: ["resolved-world-view", request],
+    queryFn: () => {
+      if (!request) {
+        return Promise.reject(new Error("No world-view resolution request"));
+      }
+      return resolveWorldView(request);
+    },
+    enabled: enabled && request !== null,
+    refetchInterval:
+      request?.binding.reference.kind === "local-world-mirror-latest"
+        ? 10_000
+        : false,
   });
 }

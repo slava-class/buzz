@@ -37,15 +37,17 @@ import type {
   GitBashPrerequisite,
   RuntimeConfigSurface,
 } from "@/shared/api/types";
-import type {
-  RegisterLocalWorldAuthorityInput,
-  RegisterLocalWorldAuthorityResult,
-  ResolvedWorldView,
-  SetWorldViewBindingsInput,
-  SetWorldViewBindingsResult,
-  WorldViewBinding,
-  WorldViewBindingsDocument,
-  WorldViewBindingsResponse,
+import {
+  decodeEffectiveWorldViewBindings,
+  decodeResolvedWorldView,
+  type EffectiveWorldViewBindings,
+  type RegisterLocalWorldAuthorityInput,
+  type RegisterLocalWorldAuthorityResult,
+  type ResolvedWorldView,
+  type SetWorldViewBindingsInput,
+  type SetWorldViewBindingsResult,
+  type WorldViewBindingsResponse,
+  type WorldViewResolutionRequest,
 } from "@/shared/api/worldViewTypes";
 
 export * from "@/shared/api/tauriChannels";
@@ -261,25 +263,9 @@ type RawSetCanvasResult = {
   event_id: string;
 };
 
-type RawWorldViewBindingsResponse = {
-  document: WorldViewBindingsDocument;
-  event_id: string | null;
-  updated_at: number | null;
-  author: string | null;
-};
+type RawWorldViewBindingsResponse = WorldViewBindingsResponse;
 
-type RawSetWorldViewBindingsResult = {
-  ok: boolean;
-  event_id: string;
-};
-
-type RawResolvedWorldView = Omit<
-  ResolvedWorldView,
-  "bindingId" | "resolvedAt"
-> & {
-  binding_id: string;
-  resolved_at: string;
-};
+type RawSetWorldViewBindingsResult = SetWorldViewBindingsResult;
 
 /** Error normalized from a rejected Tauri invocation with its wire payload. */
 export class TauriInvokeError extends Error {
@@ -479,50 +465,45 @@ export async function registerLocalWorldAuthority(
 
 export async function getWorldViewBindings(
   channelId: string,
+  threadRootEventId: string | null = null,
 ): Promise<WorldViewBindingsResponse> {
-  const response = await invokeTauri<RawWorldViewBindingsResponse>(
+  return await invokeTauri<RawWorldViewBindingsResponse>(
     "get_world_view_bindings",
-    { channelId },
+    { channelId, threadRootEventId },
   );
-  return {
-    document: response.document,
-    eventId: response.event_id,
-    updatedAt: response.updated_at,
-    author: response.author,
-  };
+}
+
+export async function getEffectiveWorldViewBindings(
+  channelId: string,
+  threadRootEventId: string | null = null,
+): Promise<EffectiveWorldViewBindings> {
+  const response = await invokeTauri<unknown>(
+    "get_effective_world_view_bindings",
+    { channelId, threadRootEventId },
+  );
+  return decodeEffectiveWorldViewBindings(response);
 }
 
 export async function setWorldViewBindings(
   input: SetWorldViewBindingsInput,
 ): Promise<SetWorldViewBindingsResult> {
-  const response = await invokeTauri<RawSetWorldViewBindingsResult>(
+  return await invokeTauri<RawSetWorldViewBindingsResult>(
     "set_world_view_bindings",
     {
       channelId: input.channelId,
+      expectedRevisionEventId: input.expectedRevisionEventId,
       document: input.document,
     },
   );
-  return {
-    ok: response.ok,
-    eventId: response.event_id,
-  };
 }
 
 export async function resolveWorldView(
-  binding: WorldViewBinding,
+  request: WorldViewResolutionRequest,
 ): Promise<ResolvedWorldView> {
-  const response = await invokeTauri<RawResolvedWorldView>(
-    "resolve_world_view",
-    { binding },
-  );
-  return {
-    bindingId: response.binding_id,
-    presentation: response.presentation,
-    resolvedAt: response.resolved_at,
-    revision: response.revision,
-    realm: response.realm,
-    view: response.view,
-  };
+  const response = await invokeTauri<unknown>("resolve_world_view", {
+    request,
+  });
+  return decodeResolvedWorldView(response);
 }
 
 export async function getHomeFeed(

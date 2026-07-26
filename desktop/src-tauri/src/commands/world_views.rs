@@ -1,11 +1,13 @@
-use std::{ffi::OsString, process::Command};
-
 use buzz_core_pkg::{
     kind::KIND_WORLD_VIEW_BINDINGS,
+    verification::verify_event,
     world_view::{
-        WorldViewBinding, WorldViewBindingsDocument, WorldViewReference,
-        WORLD_VIEW_BINDINGS_VERSION,
+        effective_world_view_bindings, world_view_bindings_snapshot_from_verified_event,
+        WorldViewBindingScope, WorldViewBindingsDocument, WorldViewBindingsSnapshot,
     },
+};
+use buzz_world_view_resolver_pkg::{
+    resolve_world_view as resolve_typed_world_view, ResolvedWorldView, WorldViewResolutionRequest,
 };
 use tauri::State;
 
@@ -14,132 +16,168 @@ use crate::{
     relay::{query_relay, submit_event},
 };
 
-/// Read the latest channel-scoped Shivai world view bindings document.
-#[tauri::command]
-pub async fn get_world_view_bindings(
-    channel_id: String,
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+fn exact_scope(thread_root_event_id: Option<String>) -> Result<WorldViewBindingScope, String> {
+    thread_root_event_id.map_or(Ok(WorldViewBindingScope::Channel), |event_id| {
+        WorldViewBindingScope::thread(event_id)
+    })
+}
+
+fn read_command(channel_id: &str, scope: &WorldViewBindingScope) -> String {
+    let mut command = format!("buzz world-views get --channel {channel_id}");
+    if let Some(thread_root_event_id) = scope.thread_root_event_id() {
+        command.push_str(" --thread-root ");
+        command.push_str(thread_root_event_id);
+    }
+    command
+}
+
+async fn query_world_view_bindings_snapshot(
+    channel_id: &str,
+    scope: &WorldViewBindingScope,
+    state: &AppState,
+) -> Result<WorldViewBindingsSnapshot, String> {
+    let d_tag = scope.d_tag();
     let events = query_relay(
-        &state,
+        state,
         &[serde_json::json!({
             "kinds": [KIND_WORLD_VIEW_BINDINGS],
             "#h": [channel_id],
+            "#d": [d_tag],
             "limit": 1
         })],
     )
     .await?;
 
-    let Some(event) = events.first() else {
-        return Ok(serde_json::json!({
-            "document": {
-                "version": WORLD_VIEW_BINDINGS_VERSION,
-                "bindings": [],
-            },
-            "event_id": null,
-            "updated_at": null,
-            "author": null,
-        }));
+    let Some(event) = events.into_iter().next() else {
+        return Ok(WorldViewBindingsSnapshot::empty(scope.clone()));
     };
-
-    let document: WorldViewBindingsDocument = serde_json::from_str(&event.content)
-        .map_err(|error| format!("invalid world view bindings event content: {error}"))?;
-    document.validate()?;
-
-    Ok(serde_json::json!({
-        "document": document,
-        "event_id": event.id.to_hex(),
-        "updated_at": event.created_at.as_secs(),
-        "author": event.pubkey.to_hex(),
-    }))
+    let expected_channel_id = uuid::Uuid::parse_str(channel_id)
+        .map_err(|_| format!("invalid channel UUID: {channel_id}"))?;
+    let expected_scope = scope.clone();
+    tokio::task::spawn_blocking(move || {
+        verify_event(&event)
+            .map_err(|error| format!("verify world view bindings event: {error}"))?;
+        world_view_bindings_snapshot_from_verified_event(
+            &event,
+            expected_channel_id,
+            &expected_scope,
+        )
+        .map_err(|error| format!("decode world view bindings event: {error}"))
+    })
+    .await
+    .map_err(|error| format!("world view bindings verification task failed: {error}"))?
 }
 
-/// Publish a complete replacement for a channel's ordered world view bindings.
+/// Read one exact channel or thread-root Shivai world-view bindings document.
+#[tauri::command]
+pub async fn get_world_view_bindings(
+    channel_id: String,
+    thread_root_event_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let uuid = uuid::Uuid::parse_str(&channel_id)
+        .map_err(|_| format!("invalid channel UUID: {channel_id}"))?;
+    let scope = exact_scope(thread_root_event_id)?;
+    let snapshot = query_world_view_bindings_snapshot(&uuid.to_string(), &scope, &state).await?;
+    let mut value = serde_json::to_value(snapshot)
+        .map_err(|error| format!("encode world view bindings snapshot: {error}"))?;
+    value
+        .as_object_mut()
+        .expect("snapshot serializes as an object")
+        .insert(
+            "nextReadCommand".into(),
+            serde_json::Value::String(read_command(&channel_id, &scope)),
+        );
+    Ok(value)
+}
+
+/// Read effective channel bindings with exact thread-root shadowing when requested.
+#[tauri::command]
+pub async fn get_effective_world_view_bindings(
+    channel_id: String,
+    thread_root_event_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let uuid = uuid::Uuid::parse_str(&channel_id)
+        .map_err(|_| format!("invalid channel UUID: {channel_id}"))?;
+    let effective_scope = exact_scope(thread_root_event_id)?;
+    let channel_scope = WorldViewBindingScope::Channel;
+    let channel =
+        query_world_view_bindings_snapshot(&uuid.to_string(), &channel_scope, &state).await?;
+    let thread = match &effective_scope {
+        WorldViewBindingScope::Channel => None,
+        WorldViewBindingScope::Thread { .. } => Some(
+            query_world_view_bindings_snapshot(&uuid.to_string(), &effective_scope, &state).await?,
+        ),
+    };
+    let effective = effective_world_view_bindings(&channel, thread.as_ref())?;
+    let mut value = serde_json::to_value(effective)
+        .map_err(|error| format!("encode effective world view bindings: {error}"))?;
+    let mut next_read_commands = vec![read_command(&channel_id, &channel_scope)];
+    if matches!(effective_scope, WorldViewBindingScope::Thread { .. }) {
+        next_read_commands.push(read_command(&channel_id, &effective_scope));
+    }
+    value
+        .as_object_mut()
+        .expect("effective bindings serialize as an object")
+        .insert(
+            "nextReadCommands".into(),
+            serde_json::to_value(next_read_commands).expect("read commands serialize as strings"),
+        );
+    Ok(value)
+}
+
+/// Publish an optimistic complete replacement for one exact binding scope.
 #[tauri::command]
 pub async fn set_world_view_bindings(
     channel_id: String,
+    expected_revision_event_id: Option<String>,
     document: WorldViewBindingsDocument,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let uuid = uuid::Uuid::parse_str(&channel_id)
         .map_err(|_| format!("invalid channel UUID: {channel_id}"))?;
     document.validate()?;
-    let builder = buzz_sdk_pkg::build_set_world_view_bindings(uuid, &document)
-        .map_err(|error| error.to_string())?;
+    if let Some(event_id) = &expected_revision_event_id {
+        if event_id.len() != 64
+            || !event_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("expected revision event id must be 64 lowercase hex characters".into());
+        }
+    }
+    let current = query_world_view_bindings_snapshot(&channel_id, &document.scope, &state).await?;
+    if current.revision_event_id != expected_revision_event_id {
+        return Err(format!(
+            "world-view bindings revision conflict: expected {}, current {}; refresh with `{}`",
+            expected_revision_event_id.as_deref().unwrap_or("none"),
+            current.revision_event_id.as_deref().unwrap_or("none"),
+            read_command(&channel_id, &document.scope)
+        ));
+    }
+
+    let builder = buzz_sdk_pkg::build_set_world_view_bindings(
+        uuid,
+        expected_revision_event_id.as_deref(),
+        &document,
+    )
+    .map_err(|error| error.to_string())?;
     let result = submit_event(builder, &state).await?;
 
     Ok(serde_json::json!({
         "ok": true,
-        "event_id": result.event_id,
+        "revisionEventId": result.event_id,
+        "nextReadCommand": read_command(&channel_id, &document.scope),
     }))
 }
 
-/// Resolve one bound local or hosted world view through the canonical `world` CLI.
+/// Resolve one bound local or hosted world view through the shared typed resolver.
 #[tauri::command]
-pub async fn resolve_world_view(binding: WorldViewBinding) -> Result<serde_json::Value, String> {
-    WorldViewBindingsDocument {
-        version: WORLD_VIEW_BINDINGS_VERSION,
-        bindings: vec![binding.clone()],
-    }
-    .validate()?;
-
-    let binary = std::env::var_os("SHIVAI_WORLD_BIN").unwrap_or_else(|| OsString::from("world"));
-    let sensitive_token = match &binding.reference {
-        WorldViewReference::HostedWorldViewExport { share_token, .. } => Some(share_token.clone()),
-        WorldViewReference::LocalWorldMirrorLatest { .. } => None,
-    };
-    let args = binding.world_cli_args();
-
-    let output =
-        tauri::async_runtime::spawn_blocking(move || Command::new(binary).args(args).output())
-            .await
-            .map_err(|error| format!("world view resolver task failed: {error}"))?
-            .map_err(|error| format!("could not launch the Shivai world resolver: {error}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let diagnostics = sensitive_token
-            .as_ref()
-            .map_or(stderr.clone(), |token| stderr.replace(token, "<redacted>"));
-        return Err(if diagnostics.is_empty() {
-            "Shivai world view resolution failed without diagnostics".into()
-        } else {
-            diagnostics
-        });
-    }
-
-    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("Shivai world resolver returned invalid JSON: {error}"))?;
-    if envelope.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Err("Shivai world resolver returned a non-success envelope".into());
-    }
-    let result = envelope
-        .get("result")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| "Shivai world resolver omitted its result".to_string())?;
-    let presentation = result
-        .get("presentation")
-        .cloned()
-        .ok_or_else(|| "Shivai world resolver omitted normalized presentation data".to_string())?;
-    let revision = result
-        .get("revision")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "Shivai world resolver omitted its revision".to_string())?;
-    let realm = result
-        .get("realm")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| "Shivai world resolver omitted its realm readback".to_string())?;
-    let view = result
-        .get("view")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| "Shivai world resolver omitted its view readback".to_string())?;
-
-    Ok(serde_json::json!({
-        "binding_id": binding.id,
-        "presentation": presentation,
-        "resolved_at": chrono::Utc::now().to_rfc3339(),
-        "revision": revision,
-        "realm": realm,
-        "view": view,
-    }))
+pub async fn resolve_world_view(
+    request: WorldViewResolutionRequest,
+) -> Result<ResolvedWorldView, String> {
+    resolve_typed_world_view(request)
+        .await
+        .map_err(|error| error.to_string())
 }
