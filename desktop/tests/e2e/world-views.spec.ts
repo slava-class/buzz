@@ -328,6 +328,21 @@ test.describe("Shivai world views", () => {
         return renderedNodes ? JSON.parse(renderedNodes).length : 0;
       })
       .toBe(4);
+    const graphCaptureSurface = worldViews.getByTestId(
+      "workbench-graph-capture-surface",
+    );
+    const fitGraphButton = worldViews.getByRole("button", {
+      name: "Fit graph",
+    });
+    await fitGraphButton.click();
+    await expect(graphCaptureSurface).toHaveAttribute(
+      "data-workbench-viewport-motion",
+      "active",
+    );
+    await expect(graphCaptureSurface).toHaveAttribute(
+      "data-workbench-viewport-motion",
+      "idle",
+    );
     const initialZoom = Number(
       await graphCanvas.getAttribute("data-workbench-zoom"),
     );
@@ -347,7 +362,7 @@ test.describe("Shivai world views", () => {
         Number(await graphCanvas.getAttribute("data-workbench-zoom")),
       )
       .toBeGreaterThan(zoomedOut);
-    await worldViews.getByRole("button", { name: "Fit graph" }).click();
+    await fitGraphButton.click();
     await expect(graphCanvas).toHaveAttribute(
       "data-workbench-layout-state",
       "idle",

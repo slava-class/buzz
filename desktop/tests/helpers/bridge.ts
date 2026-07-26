@@ -1,6 +1,6 @@
 import type { Page } from "@playwright/test";
+import type { ChannelTemplate } from "../../src/shared/api/types";
 import type {
-  ChannelTemplate,
   ResolvedWorldView,
   WorldViewBindingsDocument,
 } from "../../src/shared/api/worldViewTypes";
