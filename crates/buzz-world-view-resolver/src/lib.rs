@@ -1,5 +1,6 @@
 mod presentation;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -16,6 +17,7 @@ use uuid::Uuid;
 pub use presentation::*;
 
 const WORLD_VIEW_RESOLUTION_FORMAT_VERSION: u8 = 1;
+const WORLD_VIEW_CATALOG_FORMAT_VERSION: u8 = 1;
 
 /// Everything needed to resolve one binding without consulting ambient UI state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +46,18 @@ impl WorldViewResolutionRequest {
         Ok(())
     }
 }
+/// Private machine-local authority supplied by the caller for one resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldViewResolutionAccess {
+    None,
+    HostedEditShareFile { credential_file: PathBuf },
+}
+
+impl Default for WorldViewResolutionAccess {
+    fn default() -> Self {
+        Self::None
+    }
+}
 
 /// Credential-free authority readback for the source that produced a resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,10 +66,20 @@ pub enum WorldViewResolutionAuthority {
     HostedWorldViewExport {
         origin: String,
     },
+    HostedWorldLiveViewShare {
+        origin: String,
+        #[serde(rename = "hostedWorldId")]
+        hosted_world_id: String,
+    },
     LocalWorldMirrorLatest {
         origin: String,
         #[serde(rename = "mirrorId")]
         mirror_id: String,
+    },
+    HostedWorldLatest {
+        origin: String,
+        #[serde(rename = "hostedWorldId")]
+        hosted_world_id: String,
     },
 }
 
@@ -71,6 +95,24 @@ pub enum WorldViewResolutionFreshness {
 pub struct ResolvedWorldViewEntity {
     pub name: String,
     pub qualified_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorldViewCatalogEntry {
+    pub name: String,
+    pub qualified_name: String,
+    pub realm: ResolvedWorldViewEntity,
+}
+
+/// Canonical authored view identities available through one public source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorldViewCatalog {
+    pub format_version: u8,
+    pub revision: String,
+    pub world_qualified_name: String,
+    pub views: Vec<WorldViewCatalogEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +241,10 @@ pub struct ResolvedWorldView {
 pub enum WorldViewResolutionError {
     #[error("invalid world-view resolution request: {0}")]
     InvalidRequest(String),
+    #[error(
+        "hosted world `{hosted_world_id}` has no private edit-share authority registered on this client"
+    )]
+    MissingHostedAuthority { hosted_world_id: String },
     #[error("could not launch the Shivai world resolver `{binary}`: {source}")]
     Launch {
         binary: PathBuf,
@@ -229,6 +275,7 @@ struct WorldResultEnvelope<T> {
 #[serde(rename_all = "camelCase")]
 struct WorldViewDumpResult {
     revision: String,
+    hosted_world_id: Option<String>,
     realm: ResolvedWorldViewEntity,
     view: ResolvedWorldViewEntity,
     counts: ResolvedWorldViewCounts,
@@ -240,14 +287,99 @@ struct WorldViewDumpResult {
     edges: Vec<ResolvedWorldViewEdge>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorldViewCatalogResult {
+    command: String,
+    format_version: u8,
+    revision: String,
+    world_qualified_name: String,
+    views: Vec<WorldViewCatalogEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedEditShareInspection {
+    pub hosted_world_id: String,
+    pub revision: String,
+}
+
+/// Stable public live-view capability minted from private hosted authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublishedHostedLiveViewShare {
+    pub hosted_world_id: String,
+    pub source_revision: String,
+    pub package_revision: String,
+    pub realm_qualified_name: String,
+    pub view_qualified_name: String,
+    pub share_token: String,
+    pub share_url_path: String,
+    pub title: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorldHostedPublishLiveViewShareResult {
+    command: String,
+    live_view_share: WorldHostedLiveViewShare,
+    source: WorldHostedLiveViewShareSource,
+    selection: WorldHostedLiveViewShareSelection,
+    revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorldHostedLiveViewShare {
+    share_token: String,
+    share_url_path: String,
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorldHostedLiveViewShareSource {
+    hosted_world_id: String,
+    revision_id: String,
+    package_revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorldHostedLiveViewShareSelection {
+    realm_qualified_name: String,
+    view_qualified_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorldHostedLatestResult {
+    projection: WorldHostedLatestProjection,
+    revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorldHostedLatestProjection {
+    hosted_world_id: String,
+}
+
 /// Resolve using `SHIVAI_WORLD_BIN`, or `world` when the override is absent.
 pub async fn resolve_world_view(
     request: WorldViewResolutionRequest,
 ) -> Result<ResolvedWorldView, WorldViewResolutionError> {
+    resolve_world_view_with_access(request, WorldViewResolutionAccess::None).await
+}
+
+/// Resolve with explicit private machine-local authority.
+pub async fn resolve_world_view_with_access(
+    request: WorldViewResolutionRequest,
+    access: WorldViewResolutionAccess,
+) -> Result<ResolvedWorldView, WorldViewResolutionError> {
     let binary = std::env::var_os("SHIVAI_WORLD_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("world"));
-    resolve_world_view_with_binary(request, binary).await
+    resolve_world_view_with_binary_and_access(request, binary, access).await
 }
 
 /// Resolve through one explicitly selected source `world` binary.
@@ -255,9 +387,61 @@ pub async fn resolve_world_view_with_binary(
     request: WorldViewResolutionRequest,
     binary: impl AsRef<Path>,
 ) -> Result<ResolvedWorldView, WorldViewResolutionError> {
+    resolve_world_view_with_binary_and_access(request, binary, WorldViewResolutionAccess::None)
+        .await
+}
+
+/// Resolve through one source `world` binary with explicit private authority.
+pub async fn resolve_world_view_with_binary_and_access(
+    request: WorldViewResolutionRequest,
+    binary: impl AsRef<Path>,
+    access: WorldViewResolutionAccess,
+) -> Result<ResolvedWorldView, WorldViewResolutionError> {
     request.validate()?;
     let binary = binary.as_ref();
-    let invocation = world_cli_invocation(&request.binding);
+    let invocation = world_cli_invocation(&request.binding, &access)?;
+    let stdout = run_world_cli_invocation(binary, invocation, &request.binding.reference).await?;
+    decode_world_view_resolution(&request, &stdout, Utc::now())
+}
+
+/// List canonical authored views using `SHIVAI_WORLD_BIN`, or `world` when absent.
+pub async fn catalog_world_views(
+    reference: WorldViewReference,
+) -> Result<WorldViewCatalog, WorldViewResolutionError> {
+    catalog_world_views_with_access(reference, WorldViewResolutionAccess::None).await
+}
+
+/// List canonical authored views with explicit private machine-local authority.
+pub async fn catalog_world_views_with_access(
+    reference: WorldViewReference,
+    access: WorldViewResolutionAccess,
+) -> Result<WorldViewCatalog, WorldViewResolutionError> {
+    let binary = std::env::var_os("SHIVAI_WORLD_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("world"));
+    catalog_world_views_with_binary_and_access(reference, binary, access).await
+}
+
+/// List canonical authored views through one explicitly selected source binary.
+pub async fn catalog_world_views_with_binary_and_access(
+    reference: WorldViewReference,
+    binary: impl AsRef<Path>,
+    access: WorldViewResolutionAccess,
+) -> Result<WorldViewCatalog, WorldViewResolutionError> {
+    reference
+        .validate()
+        .map_err(WorldViewResolutionError::InvalidRequest)?;
+    let binary = binary.as_ref();
+    let invocation = world_view_cli_invocation(&reference, &access, "catalog")?;
+    let stdout = run_world_cli_invocation(binary, invocation, &reference).await?;
+    decode_world_view_catalog(&stdout)
+}
+
+async fn run_world_cli_invocation(
+    binary: &Path,
+    invocation: WorldCliInvocation<'_>,
+    reference: &WorldViewReference,
+) -> Result<Vec<u8>, WorldViewResolutionError> {
     let mut command = tokio::process::Command::new(binary);
     command
         .args(&invocation.args)
@@ -296,12 +480,60 @@ pub async fn resolve_world_view_with_binary(
                 binary: binary.to_owned(),
                 source,
             })?;
-
     if !output.status.success() {
-        let diagnostics = redact_diagnostics(
-            String::from_utf8_lossy(&output.stderr).trim(),
-            &request.binding.reference,
-        );
+        let diagnostics =
+            redact_diagnostics(String::from_utf8_lossy(&output.stderr).trim(), reference);
+        return Err(WorldViewResolutionError::CommandFailed(
+            if diagnostics.is_empty() {
+                "the command exited without diagnostics".into()
+            } else {
+                diagnostics
+            },
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Inspect one private edit-share credential without placing it in process arguments.
+pub async fn inspect_hosted_edit_share(
+    origin: &str,
+    credential_file: impl AsRef<Path>,
+) -> Result<HostedEditShareInspection, WorldViewResolutionError> {
+    let binary = std::env::var_os("SHIVAI_WORLD_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("world"));
+    inspect_hosted_edit_share_with_binary(origin, credential_file, binary).await
+}
+
+/// Inspect one private edit-share credential through an explicit source `world` binary.
+pub async fn inspect_hosted_edit_share_with_binary(
+    origin: &str,
+    credential_file: impl AsRef<Path>,
+    binary: impl AsRef<Path>,
+) -> Result<HostedEditShareInspection, WorldViewResolutionError> {
+    let binary = binary.as_ref();
+    let output = tokio::process::Command::new(binary)
+        .args([
+            "hosted",
+            "latest",
+            "--json",
+            "--base-url",
+            origin,
+            "--edit-share-file",
+            &credential_file.as_ref().to_string_lossy(),
+            "--anonymous-session",
+        ])
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|source| WorldViewResolutionError::Launch {
+            binary: binary.to_owned(),
+            source,
+        })?;
+    if !output.status.success() {
+        let diagnostics = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(WorldViewResolutionError::CommandFailed(
             if diagnostics.is_empty() {
                 "the command exited without diagnostics".into()
@@ -311,7 +543,212 @@ pub async fn resolve_world_view_with_binary(
         ));
     }
 
-    decode_world_view_resolution(&request, &output.stdout, Utc::now())
+    let envelope: WorldResultEnvelope<WorldHostedLatestResult> =
+        serde_json::from_slice(&output.stdout)?;
+    if !envelope.ok {
+        return Err(WorldViewResolutionError::InvalidResult(
+            "the command returned a non-success envelope".into(),
+        ));
+    }
+    let result = envelope.result.ok_or_else(|| {
+        WorldViewResolutionError::InvalidResult("the success envelope omitted `result`".into())
+    })?;
+    if result.projection.hosted_world_id.trim().is_empty() {
+        return Err(WorldViewResolutionError::InvalidResult(
+            "the hosted-world id is blank".into(),
+        ));
+    }
+    if result.revision.trim().is_empty() {
+        return Err(WorldViewResolutionError::InvalidResult(
+            "the hosted-world revision is blank".into(),
+        ));
+    }
+    Ok(HostedEditShareInspection {
+        hosted_world_id: result.projection.hosted_world_id,
+        revision: result.revision,
+    })
+}
+
+/// Mint or reuse a stable public live-view share using `SHIVAI_WORLD_BIN`.
+pub async fn publish_hosted_live_view_share(
+    origin: &str,
+    credential_file: impl AsRef<Path>,
+    view_qualified_name: &str,
+) -> Result<PublishedHostedLiveViewShare, WorldViewResolutionError> {
+    let binary = std::env::var_os("SHIVAI_WORLD_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("world"));
+    publish_hosted_live_view_share_with_binary(
+        origin,
+        credential_file,
+        view_qualified_name,
+        binary,
+    )
+    .await
+}
+
+/// Mint or reuse a stable public live-view share through an explicit `world` binary.
+pub async fn publish_hosted_live_view_share_with_binary(
+    origin: &str,
+    credential_file: impl AsRef<Path>,
+    view_qualified_name: &str,
+    binary: impl AsRef<Path>,
+) -> Result<PublishedHostedLiveViewShare, WorldViewResolutionError> {
+    let binary = binary.as_ref();
+    let output = tokio::process::Command::new(binary)
+        .args([
+            "hosted",
+            "view",
+            "share-live",
+            "--json",
+            "--base-url",
+            origin,
+            "--edit-share-file",
+            &credential_file.as_ref().to_string_lossy(),
+            "--anonymous-session",
+            "--view",
+            view_qualified_name,
+        ])
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|source| WorldViewResolutionError::Launch {
+            binary: binary.to_owned(),
+            source,
+        })?;
+    if !output.status.success() {
+        let diagnostics = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(WorldViewResolutionError::CommandFailed(
+            if diagnostics.is_empty() {
+                "the command exited without diagnostics".into()
+            } else {
+                diagnostics
+            },
+        ));
+    }
+
+    let envelope: WorldResultEnvelope<WorldHostedPublishLiveViewShareResult> =
+        serde_json::from_slice(&output.stdout)?;
+    if !envelope.ok {
+        return invalid_result("the command returned a non-success envelope");
+    }
+    let result = envelope.result.ok_or_else(|| {
+        WorldViewResolutionError::InvalidResult("the success envelope omitted `result`".into())
+    })?;
+    if result.command != "view.share-live" {
+        return invalid_result(format!(
+            "unexpected live-share command `{}`",
+            result.command
+        ));
+    }
+    for (field, value) in [
+        ("revision", result.revision.as_str()),
+        ("source.hostedWorldId", result.source.hosted_world_id.as_str()),
+        ("source.revisionId", result.source.revision_id.as_str()),
+        (
+            "source.packageRevision",
+            result.source.package_revision.as_str(),
+        ),
+        (
+            "selection.realmQualifiedName",
+            result.selection.realm_qualified_name.as_str(),
+        ),
+        (
+            "selection.viewQualifiedName",
+            result.selection.view_qualified_name.as_str(),
+        ),
+        (
+            "liveViewShare.shareToken",
+            result.live_view_share.share_token.as_str(),
+        ),
+        (
+            "liveViewShare.shareUrlPath",
+            result.live_view_share.share_url_path.as_str(),
+        ),
+        ("liveViewShare.title", result.live_view_share.title.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return invalid_result(format!("live-share `{field}` is blank"));
+        }
+    }
+    if result.revision != result.source.package_revision {
+        return invalid_result(
+            "live-share result revision did not match its source package revision",
+        );
+    }
+    if result.source.revision_id == result.source.package_revision {
+        return invalid_result(
+            "live-share source revision id unexpectedly matched its package revision",
+        );
+    }
+    if result.selection.view_qualified_name != view_qualified_name {
+        return invalid_result(format!(
+            "live-share view `{}` did not match requested `{view_qualified_name}`",
+            result.selection.view_qualified_name
+        ));
+    }
+
+    Ok(PublishedHostedLiveViewShare {
+        hosted_world_id: result.source.hosted_world_id,
+        source_revision: result.source.revision_id,
+        package_revision: result.source.package_revision,
+        realm_qualified_name: result.selection.realm_qualified_name,
+        view_qualified_name: result.selection.view_qualified_name,
+        share_token: result.live_view_share.share_token,
+        share_url_path: result.live_view_share.share_url_path,
+        title: result.live_view_share.title,
+    })
+}
+
+fn decode_world_view_catalog(stdout: &[u8]) -> Result<WorldViewCatalog, WorldViewResolutionError> {
+    let envelope: WorldResultEnvelope<WorldViewCatalogResult> = serde_json::from_slice(stdout)?;
+    if !envelope.ok {
+        return invalid_result("the command returned a non-success envelope");
+    }
+    let result = envelope.result.ok_or_else(|| {
+        WorldViewResolutionError::InvalidResult("the success envelope omitted `result`".into())
+    })?;
+    if result.command != "view.catalog" {
+        return invalid_result(format!("unexpected catalog command `{}`", result.command));
+    }
+    if result.format_version != WORLD_VIEW_CATALOG_FORMAT_VERSION {
+        return invalid_result(format!(
+            "unsupported catalog format version {}",
+            result.format_version
+        ));
+    }
+    if result.revision.trim().is_empty() {
+        return invalid_result("catalog `revision` is blank");
+    }
+    if result.world_qualified_name.trim().is_empty() {
+        return invalid_result("catalog `worldQualifiedName` is blank");
+    }
+
+    let mut qualified_names = HashSet::with_capacity(result.views.len());
+    for view in &result.views {
+        if view.name.trim().is_empty()
+            || view.qualified_name.trim().is_empty()
+            || view.realm.name.trim().is_empty()
+            || view.realm.qualified_name.trim().is_empty()
+        {
+            return invalid_result("catalog view names and realm identities must not be blank");
+        }
+        if !qualified_names.insert(&view.qualified_name) {
+            return invalid_result(format!(
+                "duplicate catalog view qualified name `{}`",
+                view.qualified_name
+            ));
+        }
+    }
+
+    Ok(WorldViewCatalog {
+        format_version: result.format_version,
+        revision: result.revision,
+        world_qualified_name: result.world_qualified_name,
+        views: result.views,
+    })
 }
 
 fn decode_world_view_resolution(
@@ -330,7 +767,7 @@ fn decode_world_view_resolution(
     })?;
     validate_dump_result(request, &result)?;
 
-    let (authority, freshness) = authority_readback(&request.binding.reference);
+    let (authority, freshness) = authority_readback(&request.binding.reference, &result)?;
     Ok(ResolvedWorldView {
         format_version: WORLD_VIEW_RESOLUTION_FORMAT_VERSION,
         binding_id: request.binding.id,
@@ -422,21 +859,53 @@ fn invalid_result<T>(message: impl Into<String>) -> Result<T, WorldViewResolutio
 
 fn authority_readback(
     reference: &WorldViewReference,
-) -> (WorldViewResolutionAuthority, WorldViewResolutionFreshness) {
+    result: &WorldViewDumpResult,
+) -> Result<
+    (WorldViewResolutionAuthority, WorldViewResolutionFreshness),
+    WorldViewResolutionError,
+> {
     match reference {
-        WorldViewReference::HostedWorldViewExport { origin, .. } => (
+        WorldViewReference::HostedWorldViewExport { origin, .. } => Ok((
             WorldViewResolutionAuthority::HostedWorldViewExport {
                 origin: origin.clone(),
             },
             WorldViewResolutionFreshness::Pinned,
-        ),
-        WorldViewReference::LocalWorldMirrorLatest { origin, mirror_id } => (
+        )),
+        WorldViewReference::HostedWorldLiveViewShare { origin, .. } => {
+            let hosted_world_id = result
+                .hosted_world_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    WorldViewResolutionError::InvalidResult(
+                        "hosted live-view resolution omitted `hostedWorldId`".into(),
+                    )
+                })?;
+            Ok((
+                WorldViewResolutionAuthority::HostedWorldLiveViewShare {
+                    origin: origin.clone(),
+                    hosted_world_id: hosted_world_id.to_owned(),
+                },
+                WorldViewResolutionFreshness::LatestAtResolution,
+            ))
+        }
+        WorldViewReference::LocalWorldMirrorLatest { origin, mirror_id } => Ok((
             WorldViewResolutionAuthority::LocalWorldMirrorLatest {
                 origin: origin.clone(),
                 mirror_id: mirror_id.clone(),
             },
             WorldViewResolutionFreshness::LatestAtResolution,
-        ),
+        )),
+        WorldViewReference::HostedWorldLatest {
+            origin,
+            hosted_world_id,
+        } => Ok((
+            WorldViewResolutionAuthority::HostedWorldLatest {
+                origin: origin.clone(),
+                hosted_world_id: hosted_world_id.clone(),
+            },
+            WorldViewResolutionFreshness::LatestAtResolution,
+        )),
     }
 }
 
@@ -445,13 +914,31 @@ struct WorldCliInvocation<'a> {
     stdin: Option<&'a str>,
 }
 
-fn world_cli_invocation(binding: &WorldViewBinding) -> WorldCliInvocation<'_> {
-    let (mut args, stdin) = match &binding.reference {
+fn world_cli_invocation<'a>(
+    binding: &'a WorldViewBinding,
+    access: &WorldViewResolutionAccess,
+) -> Result<WorldCliInvocation<'a>, WorldViewResolutionError> {
+    let mut invocation = world_view_cli_invocation(&binding.reference, access, "dump")?;
+    invocation.args.extend([
+        "--realm".into(),
+        binding.realm_qualified_name.clone(),
+        "--view".into(),
+        binding.view_qualified_name.clone(),
+    ]);
+    Ok(invocation)
+}
+
+fn world_view_cli_invocation<'a>(
+    reference: &'a WorldViewReference,
+    access: &WorldViewResolutionAccess,
+    subcommand: &str,
+) -> Result<WorldCliInvocation<'a>, WorldViewResolutionError> {
+    let (args, stdin) = match reference {
         WorldViewReference::LocalWorldMirrorLatest { origin, mirror_id } => (
             vec![
                 "hosted".into(),
                 "view".into(),
-                "dump".into(),
+                subcommand.into(),
                 "--json".into(),
                 "--base-url".into(),
                 origin.clone(),
@@ -467,7 +954,7 @@ fn world_cli_invocation(binding: &WorldViewBinding) -> WorldCliInvocation<'_> {
             vec![
                 "hosted".into(),
                 "view".into(),
-                "dump".into(),
+                subcommand.into(),
                 "--json".into(),
                 "--base-url".into(),
                 origin.clone(),
@@ -475,14 +962,47 @@ fn world_cli_invocation(binding: &WorldViewBinding) -> WorldCliInvocation<'_> {
             ],
             Some(share_token.as_str()),
         ),
+        WorldViewReference::HostedWorldLiveViewShare {
+            origin,
+            share_token,
+        } => (
+            vec![
+                "hosted".into(),
+                "view".into(),
+                subcommand.into(),
+                "--json".into(),
+                "--base-url".into(),
+                origin.clone(),
+                "--live-share-token-stdin".into(),
+            ],
+            Some(share_token.as_str()),
+        ),
+        WorldViewReference::HostedWorldLatest {
+            origin,
+            hosted_world_id,
+        } => {
+            let WorldViewResolutionAccess::HostedEditShareFile { credential_file } = access else {
+                return Err(WorldViewResolutionError::MissingHostedAuthority {
+                    hosted_world_id: hosted_world_id.clone(),
+                });
+            };
+            (
+                vec![
+                    "hosted".into(),
+                    "view".into(),
+                    subcommand.into(),
+                    "--json".into(),
+                    "--base-url".into(),
+                    origin.clone(),
+                    "--edit-share-file".into(),
+                    credential_file.to_string_lossy().into_owned(),
+                    "--anonymous-session".into(),
+                ],
+                None,
+            )
+        }
     };
-    args.extend([
-        "--realm".into(),
-        binding.realm_qualified_name.clone(),
-        "--view".into(),
-        binding.view_qualified_name.clone(),
-    ]);
-    WorldCliInvocation { args, stdin }
+    Ok(WorldCliInvocation { args, stdin })
 }
 
 fn redact_diagnostics(diagnostics: &str, reference: &WorldViewReference) -> String {
@@ -490,7 +1010,11 @@ fn redact_diagnostics(diagnostics: &str, reference: &WorldViewReference) -> Stri
         WorldViewReference::HostedWorldViewExport { share_token, .. } => {
             diagnostics.replace(share_token, "<redacted>")
         }
+        WorldViewReference::HostedWorldLiveViewShare { share_token, .. } => {
+            diagnostics.replace(share_token, "<redacted>")
+        }
         WorldViewReference::LocalWorldMirrorLatest { .. } => diagnostics.to_owned(),
+        WorldViewReference::HostedWorldLatest { .. } => diagnostics.to_owned(),
     }
 }
 
@@ -660,6 +1184,56 @@ mod tests {
     }
 
     #[test]
+    fn decodes_canonical_view_catalog_identities() {
+        let stdout = serde_json::to_vec(&json!({
+            "ok": true,
+            "result": {
+                "command": "view.catalog",
+                "formatVersion": 1,
+                "revision": "source-revision-1",
+                "root": "hosted-local-mirror:mirror-1",
+                "worldQualifiedName": "world",
+                "views": [{
+                    "name": "@Board",
+                    "qualifiedName": "@main::Board",
+                    "realm": {
+                        "name": "main",
+                        "qualifiedName": "world::main"
+                    }
+                }]
+            },
+            "diagnostics": []
+        }))
+        .unwrap();
+
+        let catalog = decode_world_view_catalog(&stdout).unwrap();
+
+        assert_eq!(catalog.world_qualified_name, "world");
+        assert_eq!(catalog.views[0].qualified_name, "@main::Board");
+        assert_eq!(catalog.views[0].realm.qualified_name, "world::main");
+    }
+
+    #[test]
+    fn catalog_routes_export_capability_over_stdin_without_a_selection() {
+        let reference = WorldViewReference::HostedWorldViewExport {
+            origin: "https://manifest.shivai.space".into(),
+            share_token: "secret-view-token".into(),
+        };
+
+        let invocation =
+            world_view_cli_invocation(&reference, &WorldViewResolutionAccess::None, "catalog")
+                .unwrap();
+
+        assert_eq!(&invocation.args[..3], ["hosted", "view", "catalog"]);
+        assert!(invocation
+            .args
+            .iter()
+            .any(|argument| argument == "--share-token-stdin"));
+        assert!(!invocation.args.iter().any(|argument| argument == "--realm"));
+        assert_eq!(invocation.stdin, Some("secret-view-token"));
+    }
+
+    #[test]
     fn decodes_one_typed_resolution_and_omits_the_hosted_token() {
         let request = request(WorldViewReference::HostedWorldViewExport {
             origin: "https://manifest.shivai.space".into(),
@@ -719,7 +1293,8 @@ mod tests {
             share_token: "secret-view-token".into(),
         });
 
-        let invocation = world_cli_invocation(&request.binding);
+        let invocation =
+            world_cli_invocation(&request.binding, &WorldViewResolutionAccess::None).unwrap();
 
         assert!(invocation
             .args
@@ -727,6 +1302,42 @@ mod tests {
             .any(|argument| argument == "--share-token-stdin"));
         assert!(!invocation.args.join(" ").contains("secret-view-token"));
         assert_eq!(invocation.stdin, Some("secret-view-token"));
+    }
+
+    #[test]
+    fn routes_hosted_mutation_authority_through_a_credential_file() {
+        let request = request(WorldViewReference::HostedWorldLatest {
+            origin: "https://manifest.shivai.space".into(),
+            hosted_world_id: "hosted-1".into(),
+        });
+        let access = WorldViewResolutionAccess::HostedEditShareFile {
+            credential_file: PathBuf::from("/private/edit-share.txt"),
+        };
+
+        let invocation = world_cli_invocation(&request.binding, &access).unwrap();
+
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| { pair == ["--edit-share-file", "/private/edit-share.txt"] }));
+        assert!(invocation
+            .args
+            .iter()
+            .any(|argument| argument == "--anonymous-session"));
+        assert_eq!(invocation.stdin, None);
+        let envelope: WorldResultEnvelope<WorldViewDumpResult> =
+            serde_json::from_slice(&success_stdout("source-revision-1")).unwrap();
+        let result = envelope.result.unwrap();
+        assert_eq!(
+            authority_readback(&request.binding.reference, &result).unwrap(),
+            (
+                WorldViewResolutionAuthority::HostedWorldLatest {
+                    origin: "https://manifest.shivai.space".into(),
+                    hosted_world_id: "hosted-1".into(),
+                },
+                WorldViewResolutionFreshness::LatestAtResolution,
+            )
+        );
     }
 
     #[cfg(unix)]

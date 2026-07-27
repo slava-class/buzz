@@ -72,10 +72,12 @@ export function ChannelWorldViews({
   const editing = editorTarget !== null;
   function resetEditor(): void {
     setEditorTarget(null);
+    setIsMaximized(false);
   }
 
   function beginEditing(binding: WorldViewBinding | null = null): void {
     setEditorTarget({ binding });
+    setIsMaximized(true);
     setExpanded(true);
   }
 
@@ -88,7 +90,7 @@ export function ChannelWorldViews({
   async function removeBinding(binding: WorldViewBinding): Promise<void> {
     try {
       await publishDocument({
-        version: 2,
+        version: 4,
         scope: bindingScope,
         bindings: bindings.filter((candidate) => candidate.id !== binding.id),
       });
@@ -447,6 +449,15 @@ function ChannelWorldViewTile({
   }
 
   if (!resolvedQuery.data) return null;
+  const freshnessLabel =
+    resolvedQuery.data.freshness === "pinned"
+      ? "Pinned export"
+      : resolvedQuery.data.authority.kind === "hosted-world-latest"
+        ? "Latest hosted world"
+        : resolvedQuery.data.authority.kind ===
+            "hosted-world-live-view-share"
+          ? "Latest shared view"
+          : "Latest mirror";
   return (
     <WorldViewTileSurface
       appearance={isDark ? "dark" : "light"}
@@ -456,11 +467,7 @@ function ChannelWorldViewTile({
         await resolvedQuery.refetch();
       }}
       presentation={resolvedQuery.data.presentation}
-      subtitle={`${
-        resolvedQuery.data.freshness === "pinned"
-          ? "Pinned export"
-          : "Latest mirror"
-      } · ${resolvedQuery.data.realm.qualifiedName}`}
+      subtitle={`${freshnessLabel} · ${resolvedQuery.data.realm.qualifiedName}`}
       title={entry.binding.label ?? resolvedQuery.data.view.name}
     />
   );

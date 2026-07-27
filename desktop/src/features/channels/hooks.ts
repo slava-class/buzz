@@ -7,6 +7,8 @@ import {
   createChannel,
   deleteChannel,
   getCanvas,
+  catalogWorldViews,
+  connectLocalWorldAuthority,
   getEffectiveWorldViewBindings,
   getWorldViewBindings,
   getChannelDetails,
@@ -17,7 +19,9 @@ import {
   leaveChannel,
   openDm,
   removeChannelMember,
-  registerLocalWorldAuthority,
+  listWorldAuthorities,
+  registerHostedWorldAuthority,
+  publishHostedWorldLiveViewShare,
   resolveWorldView,
   setCanvas,
   setWorldViewBindings,
@@ -39,8 +43,10 @@ import type {
   UpdateChannelInput,
 } from "@/shared/api/types";
 import type {
-  RegisterLocalWorldAuthorityInput,
+  ConnectLocalWorldAuthorityInput,
+  RegisterHostedWorldAuthorityInput,
   SetWorldViewBindingsInput,
+  WorldViewReference,
   WorldViewBindingScope,
   WorldViewResolutionRequest,
 } from "@/shared/api/worldViewTypes";
@@ -51,6 +57,9 @@ import {
 } from "@/features/channels/channelSnapshot";
 
 export const channelsQueryKey = ["channels"] as const;
+export const worldAuthoritiesQueryKey = ["world-authorities"] as const;
+const worldViewCatalogQueryKey = (reference: WorldViewReference) =>
+  ["world-view-catalog", reference] as const;
 const channelDetailQueryKey = (channelId: string) =>
   ["channels", channelId, "detail"] as const;
 const channelMembersQueryKey = (channelId: string) =>
@@ -763,10 +772,73 @@ export function useEffectiveWorldViewBindingsQuery(
   });
 }
 
-export function useRegisterLocalWorldAuthorityMutation() {
+export function useWorldAuthoritiesQuery(enabled = true) {
+  return useQuery({
+    queryKey: worldAuthoritiesQueryKey,
+    queryFn: listWorldAuthorities,
+    enabled,
+  });
+}
+
+export function useWorldViewCatalogQuery(
+  reference: WorldViewReference | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: reference
+      ? worldViewCatalogQueryKey(reference)
+      : ["world-view-catalog", null],
+    queryFn: () => {
+      if (!reference) {
+        return Promise.reject(new Error("No world source selected"));
+      }
+      return catalogWorldViews(reference);
+    },
+    enabled: enabled && reference !== null,
+  });
+}
+
+export function useConnectLocalWorldAuthorityMutation() {
+  const queryClient = useQueryClient();
+
   return useMutation({
-    mutationFn: (input: RegisterLocalWorldAuthorityInput) =>
-      registerLocalWorldAuthority(input),
+    mutationFn: (input: ConnectLocalWorldAuthorityInput) =>
+      connectLocalWorldAuthority(input),
+    onSuccess: async (result) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: worldAuthoritiesQueryKey,
+        }),
+        queryClient.invalidateQueries({
+          queryKey: worldViewCatalogQueryKey(result.worldRef),
+        }),
+      ]);
+    },
+  });
+}
+
+export function useRegisterHostedWorldAuthorityMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: RegisterHostedWorldAuthorityInput) =>
+      registerHostedWorldAuthority(input),
+    onSuccess: async (result) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: worldAuthoritiesQueryKey,
+        }),
+        queryClient.invalidateQueries({
+          queryKey: worldViewCatalogQueryKey(result.worldRef),
+        }),
+      ]);
+    },
+  });
+}
+
+export function usePublishHostedWorldLiveViewShareMutation() {
+  return useMutation({
+    mutationFn: publishHostedWorldLiveViewShare,
   });
 }
 
@@ -820,8 +892,8 @@ export function useResolvedWorldViewQuery(
     },
     enabled: enabled && request !== null,
     refetchInterval:
-      request?.binding.reference.kind === "local-world-mirror-latest"
-        ? 10_000
-        : false,
+      request?.binding.reference.kind === "hosted-world-view-export"
+        ? false
+        : 10_000,
   });
 }

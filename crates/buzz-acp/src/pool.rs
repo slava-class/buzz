@@ -1430,7 +1430,7 @@ pub async fn run_prompt_task(
             .map(|ci| ci.channel_type == "dm")
             .unwrap_or(true);
         if !is_dm {
-            let authorities = load_local_world_authority_registry(&ctx.cwd);
+            let authorities = load_world_authority_registry(&ctx.cwd);
             let thread_root_event_id = batch.as_ref().and_then(world_view_thread_root);
             current_world_views = fetch_world_view_bindings_section(
                 *cid,
@@ -2378,39 +2378,35 @@ async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<Str
     canvas_section_from_query_response(&events, &channel_id.to_string())
 }
 
-fn load_local_world_authority_registry(
-    cwd: &str,
-) -> buzz_core::world_view::LocalWorldAuthorityRegistry {
-    use buzz_core::world_view::{
-        LocalWorldAuthorityRegistry, LOCAL_WORLD_AUTHORITY_REGISTRY_FILE_NAME,
-    };
+fn load_world_authority_registry(cwd: &str) -> buzz_core::world_view::WorldAuthorityRegistry {
+    use buzz_core::world_view::{WorldAuthorityRegistry, WORLD_AUTHORITY_REGISTRY_FILE_NAME};
 
-    let path = std::path::Path::new(cwd).join(LOCAL_WORLD_AUTHORITY_REGISTRY_FILE_NAME);
+    let path = std::path::Path::new(cwd).join(WORLD_AUTHORITY_REGISTRY_FILE_NAME);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return LocalWorldAuthorityRegistry::default();
+            return WorldAuthorityRegistry::default();
         }
         Err(error) => {
             tracing::warn!(
                 target: "channel_context::world_authority",
                 path = %path.display(),
                 %error,
-                "failed to read local world authority registry",
+                "failed to read world authority registry",
             );
-            return LocalWorldAuthorityRegistry::default();
+            return WorldAuthorityRegistry::default();
         }
     };
-    let registry: LocalWorldAuthorityRegistry = match serde_json::from_str(&text) {
+    let registry: WorldAuthorityRegistry = match serde_json::from_str(&text) {
         Ok(registry) => registry,
         Err(error) => {
             tracing::warn!(
                 target: "channel_context::world_authority",
                 path = %path.display(),
                 %error,
-                "local world authority registry contains invalid JSON",
+                "world authority registry contains invalid JSON",
             );
-            return LocalWorldAuthorityRegistry::default();
+            return WorldAuthorityRegistry::default();
         }
     };
     if let Err(error) = registry.validate() {
@@ -2418,9 +2414,9 @@ fn load_local_world_authority_registry(
             target: "channel_context::world_authority",
             path = %path.display(),
             %error,
-            "local world authority registry failed validation",
+            "world authority registry failed validation",
         );
-        return LocalWorldAuthorityRegistry::default();
+        return WorldAuthorityRegistry::default();
     }
     registry
 }
@@ -2460,7 +2456,7 @@ async fn fetch_world_view_bindings_section(
     channel_id: Uuid,
     thread_root_event_id: Option<&str>,
     rest: &RestClient,
-    authorities: &buzz_core::world_view::LocalWorldAuthorityRegistry,
+    authorities: &buzz_core::world_view::WorldAuthorityRegistry,
 ) -> Option<String> {
     use buzz_core::world_view::{
         effective_world_view_bindings, WorldViewBindingScope, WorldViewBindingsSnapshot,
@@ -2520,11 +2516,30 @@ async fn fetch_world_view_bindings_section(
                 effective_scope: state.effective.effective_scope.clone(),
                 binding_revision_event_id: entry.binding_revision_event_id.clone(),
             };
+            let access = match &entry.binding.reference {
+                buzz_core::world_view::WorldViewReference::HostedWorldLatest {
+                    origin,
+                    hosted_world_id,
+                } => authorities
+                    .resolve_hosted(origin, hosted_world_id)
+                    .map(|authority| {
+                        buzz_world_view_resolver::WorldViewResolutionAccess::HostedEditShareFile {
+                            credential_file: authority.credential_file.clone().into(),
+                        }
+                    })
+                    .unwrap_or_default(),
+                buzz_core::world_view::WorldViewReference::HostedWorldViewExport { .. }
+                | buzz_core::world_view::WorldViewReference::HostedWorldLiveViewShare { .. }
+                | buzz_core::world_view::WorldViewReference::LocalWorldMirrorLatest { .. } => {
+                    buzz_world_view_resolver::WorldViewResolutionAccess::None
+                }
+            };
             async move {
                 let binding_id = request.binding.id;
-                let resolution = buzz_world_view_resolver::resolve_world_view(request)
-                    .await
-                    .map_err(|error| error.to_string());
+                let resolution =
+                    buzz_world_view_resolver::resolve_world_view_with_access(request, access)
+                        .await
+                        .map_err(|error| error.to_string());
                 (binding_id, resolution)
             }
         }))
@@ -2741,14 +2756,16 @@ fn world_view_bindings_state_from_query_response(
 
 fn render_world_view_bindings_section(
     state: &EffectiveWorldViewBindingsPromptState,
-    authorities: &buzz_core::world_view::LocalWorldAuthorityRegistry,
+    authorities: &buzz_core::world_view::WorldAuthorityRegistry,
     resolutions: &[(
         Uuid,
         Result<buzz_world_view_resolver::ResolvedWorldView, String>,
     )],
 ) -> String {
     use buzz_core::world_view::{WorldViewBindingScope, WorldViewDisplayMode, WorldViewReference};
-    use buzz_world_view_resolver::WorldViewResolutionFreshness;
+    use buzz_world_view_resolver::{
+        WorldViewResolutionAuthority, WorldViewResolutionFreshness,
+    };
 
     let mut lines = vec![
         "[Shivai World Views]".to_string(),
@@ -2784,15 +2801,42 @@ fn render_world_view_bindings_section(
     }
     for entry in &state.effective.bindings {
         let binding = &entry.binding;
+        let resolution = resolutions
+            .iter()
+            .find(|(binding_id, _)| binding_id == &binding.id)
+            .map(|(_, resolution)| resolution);
         let local_authority = match &binding.reference {
             WorldViewReference::LocalWorldMirrorLatest { origin, mirror_id } => {
-                authorities.resolve(origin, mirror_id)
+                authorities.resolve_local(origin, mirror_id)
             }
-            WorldViewReference::HostedWorldViewExport { .. } => None,
+            WorldViewReference::HostedWorldLatest { .. }
+            | WorldViewReference::HostedWorldViewExport { .. }
+            | WorldViewReference::HostedWorldLiveViewShare { .. } => None,
+        };
+        let hosted_authority = match &binding.reference {
+            WorldViewReference::HostedWorldLatest {
+                origin,
+                hosted_world_id,
+            } => authorities.resolve_hosted(origin, hosted_world_id),
+            WorldViewReference::HostedWorldLiveViewShare { .. } => resolution
+                .and_then(|resolution| resolution.as_ref().ok())
+                .and_then(|resolved| match &resolved.authority {
+                    WorldViewResolutionAuthority::HostedWorldLiveViewShare {
+                        origin,
+                        hosted_world_id,
+                    } => authorities.resolve_hosted(origin, hosted_world_id),
+                    _ => None,
+                }),
+            WorldViewReference::HostedWorldViewExport { .. }
+            | WorldViewReference::LocalWorldMirrorLatest { .. } => None,
         };
         let source = match &binding.reference {
             WorldViewReference::LocalWorldMirrorLatest { .. } => "local-world-mirror-latest",
             WorldViewReference::HostedWorldViewExport { .. } => "hosted-world-view-export",
+            WorldViewReference::HostedWorldLiveViewShare { .. } => {
+                "hosted-world-live-view-share"
+            }
+            WorldViewReference::HostedWorldLatest { .. } => "hosted-world-latest",
         };
         let display = match binding.display_mode {
             WorldViewDisplayMode::Graph => "graph",
@@ -2813,11 +2857,7 @@ fn render_world_view_bindings_section(
             entry.binding_revision_event_id
         ));
 
-        match resolutions
-            .iter()
-            .find(|(binding_id, _)| binding_id == &binding.id)
-            .map(|(_, resolution)| resolution)
-        {
+        match resolution {
             Some(Ok(resolved)) => {
                 let freshness = match resolved.freshness {
                     WorldViewResolutionFreshness::Pinned => "pinned",
@@ -2875,8 +2915,8 @@ fn render_world_view_bindings_section(
             }
         }
 
-        match (&binding.reference, local_authority) {
-            (WorldViewReference::LocalWorldMirrorLatest { .. }, Some(authority)) => {
+        match (&binding.reference, local_authority, hosted_authority) {
+            (WorldViewReference::LocalWorldMirrorLatest { .. }, Some(authority), _) => {
                 let source_root = serde_json::to_string(&authority.source_root)
                     .unwrap_or_else(|_| "\"<invalid local source root>\"".into());
                 lines.push("  Authority: mutable local source".into());
@@ -2890,13 +2930,48 @@ fn render_world_view_bindings_section(
                         .into(),
                 );
             }
-            (WorldViewReference::LocalWorldMirrorLatest { .. }, None) => lines.push(
+            (WorldViewReference::LocalWorldMirrorLatest { .. }, None, _) => lines.push(
                 "  Authority: read-only public mirror; no mutable source is registered on this host."
                     .into(),
             ),
-            (WorldViewReference::HostedWorldViewExport { .. }, _) => {
+            (WorldViewReference::HostedWorldViewExport { .. }, _, _) => {
                 lines.push("  Authority: read-only hosted view export".into());
             }
+            (
+                WorldViewReference::HostedWorldLatest { origin, .. }
+                | WorldViewReference::HostedWorldLiveViewShare { origin, .. },
+                _,
+                Some(authority),
+            ) => {
+                let origin = serde_json::to_string(origin)
+                    .unwrap_or_else(|_| "\"<invalid hosted origin>\"".into());
+                let credential_file = serde_json::to_string(&authority.credential_file)
+                    .unwrap_or_else(|_| "\"<invalid credential file>\"".into());
+                let revision = resolution
+                    .and_then(|resolution| resolution.as_ref().ok())
+                    .map(|resolved| resolved.source_revision.as_str())
+                    .unwrap_or("<revision-from-latest>");
+                lines.push("  Authority: mutable hosted world".into());
+                lines.push(format!(
+                    "  Read: world hosted latest --json --base-url {origin} --edit-share-file {credential_file} --anonymous-session"
+                ));
+                lines.push(format!(
+                    "  Edit: world hosted script --json --base-url {origin} --edit-share-file {credential_file} --anonymous-session --expected-revision {revision} --stdin"
+                ));
+                lines.push(
+                    "  Concurrency: after a revision conflict, re-read latest and reassess before issuing a new revision-checked mutation."
+                        .into(),
+                );
+            }
+            (
+                WorldViewReference::HostedWorldLatest { .. }
+                | WorldViewReference::HostedWorldLiveViewShare { .. },
+                _,
+                None,
+            ) => lines.push(
+                "  Authority: read-only on this client; register the hosted edit-share URL here to enable mutation."
+                    .into(),
+            ),
         }
     }
     lines.join("\n")
@@ -6085,12 +6160,70 @@ mod tests {
         );
     }
 
+    fn empty_resolved_world_view(
+        binding_id: Uuid,
+        authority: serde_json::Value,
+    ) -> buzz_world_view_resolver::ResolvedWorldView {
+        let presentation_model = serde_json::json!({
+            "graph": { "kind": "empty", "reason": "no-preferences" },
+            "revision": "source-revision-1",
+            "selection": {
+                "realmQualifiedName": "delivery::main",
+                "viewQualifiedName": "delivery::main::@Remaining"
+            }
+        });
+        serde_json::from_value(serde_json::json!({
+            "formatVersion": 1,
+            "bindingId": binding_id,
+            "channelId": CHANNEL_UUID,
+            "declaredScope": { "kind": "channel" },
+            "effectiveScope": { "kind": "channel" },
+            "bindingRevisionEventId": "a".repeat(64),
+            "sourceRevision": "source-revision-1",
+            "freshness": "latest-at-resolution",
+            "authority": authority,
+            "realm": {
+                "name": "main",
+                "qualifiedName": "delivery::main"
+            },
+            "view": {
+                "name": "Remaining",
+                "qualifiedName": "delivery::main::@Remaining"
+            },
+            "viewDump": {
+                "counts": {
+                    "nodes": 0,
+                    "edges": 0,
+                    "ready": 0,
+                    "actionableReady": 0,
+                    "satisfied": 0,
+                    "blocked": 0
+                },
+                "nodes": [],
+                "readyLeaves": [],
+                "satisfiedNodes": [],
+                "blockedNodes": [],
+                "edges": []
+            },
+            "presentation": {
+                "formatVersion": 1,
+                "dark": presentation_model,
+                "light": presentation_model
+            },
+            "resolvedAt": "2026-07-24T12:00:00Z",
+            "nextCommand": format!(
+                "buzz world-views resolve --channel {CHANNEL_UUID} --binding {binding_id}"
+            )
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn world_view_prompt_exposes_registered_local_mutation_authority() {
         use buzz_core::world_view::{
-            LocalWorldAuthority, LocalWorldAuthorityRegistry, WorldViewBinding,
-            WorldViewBindingScope, WorldViewBindingsDocument, WorldViewDisplayMode,
-            WorldViewReference, WORLD_VIEW_BINDINGS_VERSION,
+            LocalWorldAuthority, WorldAuthorityRegistry, WorldViewBinding, WorldViewBindingScope,
+            WorldViewBindingsDocument, WorldViewDisplayMode, WorldViewReference,
+            WORLD_AUTHORITY_REGISTRY_VERSION, WORLD_VIEW_BINDINGS_VERSION,
         };
 
         let binding_id = Uuid::nil();
@@ -6124,13 +6257,14 @@ mod tests {
         ])
         .sign_with_keys(&Keys::generate())
         .unwrap();
-        let registry = LocalWorldAuthorityRegistry {
-            version: buzz_core::world_view::LOCAL_WORLD_AUTHORITY_REGISTRY_VERSION,
-            authorities: vec![LocalWorldAuthority {
+        let registry = WorldAuthorityRegistry {
+            version: WORLD_AUTHORITY_REGISTRY_VERSION,
+            local_authorities: vec![LocalWorldAuthority {
                 origin: "https://manifest.shivai.space".into(),
                 mirror_id: "mirror-1".into(),
                 source_root: "/worlds/delivery.world".into(),
             }],
+            hosted_authorities: Vec::new(),
         };
 
         let exact_state = world_view_bindings_state_from_query_response(
@@ -6139,7 +6273,6 @@ mod tests {
             &WorldViewBindingScope::Channel,
         )
         .expect("valid world binding event");
-        let binding_revision_event_id = exact_state.snapshot.revision_event_id.clone().unwrap();
         let state = EffectiveWorldViewBindingsPromptState {
             effective: buzz_core::world_view::effective_world_view_bindings(
                 &exact_state.snapshot,
@@ -6149,63 +6282,14 @@ mod tests {
             timestamp: exact_state.timestamp,
             channel_uuid: CHANNEL_UUID.into(),
         };
-        let presentation_model = serde_json::json!({
-            "graph": { "kind": "empty", "reason": "no-preferences" },
-            "revision": "source-revision-1",
-            "selection": {
-                "realmQualifiedName": "delivery::main",
-                "viewQualifiedName": "delivery::main::@Remaining"
-            }
-        });
-        let resolved: buzz_world_view_resolver::ResolvedWorldView =
-            serde_json::from_value(serde_json::json!({
-                "formatVersion": 1,
-                "bindingId": binding_id,
-                "channelId": CHANNEL_UUID,
-                "declaredScope": { "kind": "channel" },
-                "effectiveScope": { "kind": "channel" },
-                "bindingRevisionEventId": binding_revision_event_id,
-                "sourceRevision": "source-revision-1",
-                "freshness": "latest-at-resolution",
-                "authority": {
-                    "kind": "local-world-mirror-latest",
-                    "origin": "https://manifest.shivai.space",
-                    "mirrorId": "mirror-1"
-                },
-                "realm": {
-                    "name": "main",
-                    "qualifiedName": "delivery::main"
-                },
-                "view": {
-                    "name": "Remaining",
-                    "qualifiedName": "delivery::main::@Remaining"
-                },
-                "viewDump": {
-                    "counts": {
-                        "nodes": 0,
-                        "edges": 0,
-                        "ready": 0,
-                        "actionableReady": 0,
-                        "satisfied": 0,
-                        "blocked": 0
-                    },
-                    "nodes": [],
-                    "readyLeaves": [],
-                    "satisfiedNodes": [],
-                    "blockedNodes": [],
-                    "edges": []
-                },
-                "presentation": {
-                    "formatVersion": 1,
-                    "dark": presentation_model,
-                    "light": presentation_model
-                },
-                "resolvedAt": "2026-07-24T12:00:00Z",
-                "nextCommand": format!(
-                    "buzz world-views resolve --channel {CHANNEL_UUID} --binding {binding_id}"
-                )
-            }))
-            .unwrap();
+        let resolved = empty_resolved_world_view(
+            binding_id,
+            serde_json::json!({
+                "kind": "local-world-mirror-latest",
+                "origin": "https://manifest.shivai.space",
+                "mirrorId": "mirror-1"
+            }),
+        );
         let section =
             render_world_view_bindings_section(&state, &registry, &[(binding_id, Ok(resolved))]);
 
@@ -6215,5 +6299,69 @@ mod tests {
         assert!(section.contains("Authority: mutable local source"));
         assert!(section.contains(r#"Local source root: "/worlds/delivery.world""#));
         assert!(section.contains("world hosted sync-local"));
+    }
+
+    #[test]
+    fn world_view_prompt_exposes_private_hosted_mutation_authority() {
+        use buzz_core::world_view::{
+            EffectiveWorldViewBinding, EffectiveWorldViewBindings, HostedWorldAuthority,
+            WorldAuthorityRegistry, WorldViewBinding, WorldViewBindingScope, WorldViewDisplayMode,
+            WorldViewReference, WORLD_AUTHORITY_REGISTRY_VERSION,
+        };
+
+        let binding_id = Uuid::nil();
+        let binding = WorldViewBinding {
+            id: binding_id,
+            label: Some("Hosted delivery".into()),
+            reference: WorldViewReference::HostedWorldLatest {
+                origin: "https://manifest.shivai.space".into(),
+                hosted_world_id: "hosted-1".into(),
+            },
+            realm_qualified_name: "delivery::main".into(),
+            view_qualified_name: "delivery::main::@Remaining".into(),
+            display_mode: WorldViewDisplayMode::Tasks,
+        };
+        let state = EffectiveWorldViewBindingsPromptState {
+            effective: EffectiveWorldViewBindings {
+                effective_scope: WorldViewBindingScope::Channel,
+                bindings: vec![EffectiveWorldViewBinding {
+                    binding,
+                    declared_scope: WorldViewBindingScope::Channel,
+                    binding_revision_event_id: "a".repeat(64),
+                }],
+                channel_revision_event_id: Some("a".repeat(64)),
+                thread_revision_event_id: None,
+            },
+            timestamp: "2026-07-24T12:00:00Z".into(),
+            channel_uuid: CHANNEL_UUID.into(),
+        };
+        let registry = WorldAuthorityRegistry {
+            version: WORLD_AUTHORITY_REGISTRY_VERSION,
+            local_authorities: Vec::new(),
+            hosted_authorities: vec![HostedWorldAuthority {
+                origin: "https://manifest.shivai.space".into(),
+                hosted_world_id: "hosted-1".into(),
+                credential_file: "/credentials/hosted-1.edit-share".into(),
+            }],
+        };
+        let resolved = empty_resolved_world_view(
+            binding_id,
+            serde_json::json!({
+                "kind": "hosted-world-latest",
+                "origin": "https://manifest.shivai.space",
+                "hostedWorldId": "hosted-1"
+            }),
+        );
+
+        let section =
+            render_world_view_bindings_section(&state, &registry, &[(binding_id, Ok(resolved))]);
+
+        assert!(section.contains("Authority: mutable hosted world"));
+        assert!(section.contains(
+            r#"world hosted latest --json --base-url "https://manifest.shivai.space" --edit-share-file "/credentials/hosted-1.edit-share" --anonymous-session"#
+        ));
+        assert!(section.contains("--expected-revision source-revision-1 --stdin"));
+        assert!(section.contains("after a revision conflict, re-read latest"));
+        assert!(!section.contains("edit-token"));
     }
 }

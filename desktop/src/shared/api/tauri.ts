@@ -40,13 +40,23 @@ import type {
 import {
   decodeEffectiveWorldViewBindings,
   decodeResolvedWorldView,
+  decodePublishedHostedWorldLiveViewShare,
+  decodeConnectLocalWorldAuthorityResult,
+  decodeWorldViewAuthorityList,
+  decodeWorldViewCatalog,
+  type ConnectLocalWorldAuthorityInput,
+  type ConnectLocalWorldAuthorityResult,
   type EffectiveWorldViewBindings,
-  type RegisterLocalWorldAuthorityInput,
-  type RegisterLocalWorldAuthorityResult,
+  type RegisterHostedWorldAuthorityInput,
+  type RegisterHostedWorldAuthorityResult,
+  type PublishedHostedWorldLiveViewShare,
   type ResolvedWorldView,
   type SetWorldViewBindingsInput,
   type SetWorldViewBindingsResult,
   type WorldViewBindingsResponse,
+  type WorldViewAuthorityListResult,
+  type WorldViewCatalog,
+  type WorldViewReference,
   type WorldViewResolutionRequest,
 } from "@/shared/api/worldViewTypes";
 
@@ -450,17 +460,48 @@ export async function setCanvas(
   };
 }
 
-export async function registerLocalWorldAuthority(
-  input: RegisterLocalWorldAuthorityInput,
-): Promise<RegisterLocalWorldAuthorityResult> {
-  return await invokeTauri<RegisterLocalWorldAuthorityResult>(
-    "register_local_world_authority",
-    {
-      origin: input.origin,
-      mirrorId: input.mirrorId,
-      sourceRoot: input.sourceRoot,
-    },
+export async function listWorldAuthorities(): Promise<WorldViewAuthorityListResult> {
+  const response = await invokeTauri<unknown>("list_world_authorities");
+  return decodeWorldViewAuthorityList(response);
+}
+
+export async function connectLocalWorldAuthority(
+  input: ConnectLocalWorldAuthorityInput,
+): Promise<ConnectLocalWorldAuthorityResult> {
+  const response = await invokeTauri<unknown>(
+    "connect_local_world_authority",
+    input,
   );
+  return decodeConnectLocalWorldAuthorityResult(response);
+}
+
+export async function catalogWorldViews(
+  reference: WorldViewReference,
+): Promise<WorldViewCatalog> {
+  const response = await invokeTauri<unknown>("catalog_world_views", {
+    reference,
+  });
+  return decodeWorldViewCatalog(response);
+}
+
+export async function registerHostedWorldAuthority(
+  input: RegisterHostedWorldAuthorityInput,
+): Promise<RegisterHostedWorldAuthorityResult> {
+  return await invokeTauri<RegisterHostedWorldAuthorityResult>(
+    "register_hosted_world_authority",
+    { credential: input.credential, origin: input.origin },
+  );
+}
+
+export async function publishHostedWorldLiveViewShare(input: {
+  reference: Extract<WorldViewReference, { kind: "hosted-world-latest" }>;
+  viewQualifiedName: string;
+}): Promise<PublishedHostedWorldLiveViewShare> {
+  const response = await invokeTauri<unknown>(
+    "publish_hosted_world_live_view_share",
+    input,
+  );
+  return decodePublishedHostedWorldLiveViewShare(response);
 }
 
 export async function getWorldViewBindings(

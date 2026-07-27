@@ -248,48 +248,47 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
         MeshRuntimeRecovery::Live
         | MeshRuntimeRecovery::Debouncing
         | MeshRuntimeRecovery::Replaced => return Ok(()),
-        MeshRuntimeRecovery::RestartRequired => {
-            let records = crate::managed_agents::load_managed_agents(app).unwrap_or_default();
-            if !records
-                .iter()
-                .any(|record| is_running_relay_mesh_agent(record, &active_pubkeys))
-            {
-                // A foreground save may still be bringing up its first ingress.
-                // Only an already-running consumer justifies an automatic app
-                // relaunch from the background watchdog.
-                return Ok(());
-            }
-            eprintln!(
-                "buzz-mesh: supervised client startup lost its ingress before the SDK exposed a shutdown handle; restarting Buzz"
-            );
-            app.request_restart();
-            return Ok(());
-        }
         MeshRuntimeRecovery::ReleasePending => {
             return Err(format!(
                 "{MESH_REARM_ERROR_SENTINEL}old local mesh ingress is still shutting down"
             ));
         }
-        MeshRuntimeRecovery::Absent => {
-            let records = crate::managed_agents::load_managed_agents(app).unwrap_or_default();
-            if !records
-                .iter()
-                .any(|record| is_running_relay_mesh_agent(record, &active_pubkeys))
-            {
-                return Ok(());
-            }
-        }
-        MeshRuntimeRecovery::Evicted => {}
+        MeshRuntimeRecovery::Absent
+        | MeshRuntimeRecovery::Evicted
+        | MeshRuntimeRecovery::RestartRequired => {}
     }
 
     let records = crate::managed_agents::load_managed_agents(app).unwrap_or_default();
+    let personas = crate::managed_agents::load_personas(app).unwrap_or_default();
+    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
     let mesh_records: Vec<_> = records
         .into_iter()
-        .filter(|record| is_running_relay_mesh_agent(record, &active_pubkeys))
+        .filter_map(|record| {
+            running_relay_mesh_model_id(&record, &active_pubkeys, &personas, &global)
+                .map(|model_id| (record, model_id))
+        })
         .collect();
+    if mesh_records.is_empty() {
+        return Ok(());
+    }
+
+    if recovery == MeshRuntimeRecovery::RestartRequired {
+        eprintln!(
+            "buzz-mesh: supervised client startup lost its ingress before the SDK exposed a shutdown handle; restarting Buzz"
+        );
+        app.request_restart();
+        return Ok(());
+    }
+
     let mut first_error = None;
-    for record in &mesh_records {
-        match crate::commands::mesh_llm::ensure_relay_mesh_for_record(app, record, false).await {
+    for (record, model_id) in &mesh_records {
+        match crate::commands::mesh_llm::ensure_relay_mesh_for_record(
+            app,
+            Some(model_id.as_str()),
+            false,
+        )
+        .await
+        {
             Ok(()) => {
                 if let Err(error) = clear_mesh_last_error_if_set(app, &record.pubkey) {
                     eprintln!("buzz-mesh: failed to clear recovery error: {error}");
@@ -322,16 +321,24 @@ fn active_managed_agent_pubkeys(state: &AppState) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn is_running_relay_mesh_agent(
+fn running_relay_mesh_model_id(
     record: &crate::managed_agents::ManagedAgentRecord,
     active_pubkeys: &HashSet<String>,
-) -> bool {
-    record.backend == crate::managed_agents::BackendKind::Local
-        && crate::managed_agents::relay_mesh_model_id(record).is_some()
-        && active_pubkeys.contains(&record.pubkey.to_ascii_lowercase())
-        && record
+    personas: &[crate::managed_agents::AgentDefinition],
+    global: &crate::managed_agents::GlobalAgentConfig,
+) -> Option<String> {
+    if record.backend != crate::managed_agents::BackendKind::Local
+        || !active_pubkeys.contains(&record.pubkey.to_ascii_lowercase())
+        || !record
             .runtime_pid
             .is_none_or(crate::managed_agents::process_is_running)
+    {
+        return None;
+    }
+
+    crate::managed_agents::effective_config::resolve_effective_relay_mesh_model_id(
+        record, personas, global,
+    )
 }
 
 fn persist_mesh_last_error(app: &AppHandle, pubkey: &str, error: &str) -> Result<(), String> {
@@ -458,29 +465,44 @@ mod tests {
 
     #[test]
     fn only_running_relay_mesh_agents_trigger_rearm() {
+        let personas = [];
+        let global = crate::managed_agents::GlobalAgentConfig::default();
         let empty = active_set(&[]);
-        assert!(!is_running_relay_mesh_agent(
+        assert!(running_relay_mesh_model_id(
             &mesh_record("stopped", Some(std::process::id())),
-            &empty
-        ));
+            &empty,
+            &personas,
+            &global,
+        )
+        .is_none());
 
         let active = active_set(&["live"]);
-        assert!(is_running_relay_mesh_agent(
-            &mesh_record("live", Some(std::process::id())),
-            &active
-        ));
-        assert!(is_running_relay_mesh_agent(
-            &mesh_record("live", None),
-            &active
-        ));
+        assert_eq!(
+            running_relay_mesh_model_id(
+                &mesh_record("live", Some(std::process::id())),
+                &active,
+                &personas,
+                &global,
+            )
+            .as_deref(),
+            Some("Qwen3"),
+        );
+        assert_eq!(
+            running_relay_mesh_model_id(&mesh_record("live", None), &active, &personas, &global,)
+                .as_deref(),
+            Some("Qwen3"),
+        );
 
         let mut non_mesh = mesh_record("plain", Some(std::process::id()));
         non_mesh.env_vars.clear();
         non_mesh.relay_mesh = None;
-        assert!(!is_running_relay_mesh_agent(
+        assert!(running_relay_mesh_model_id(
             &non_mesh,
-            &active_set(&["plain"])
-        ));
+            &active_set(&["plain"]),
+            &personas,
+            &global,
+        )
+        .is_none());
     }
 
     #[test]

@@ -9,7 +9,9 @@ import type { ConnectionState } from "@/shared/api/relayClientShared";
 import type { ChannelTemplate, RelayEvent } from "@/shared/api/types";
 import type {
   ResolvedWorldView,
+  WorldViewAuthority,
   WorldViewBindingsDocument,
+  WorldViewCatalog,
   WorldViewResolutionRequest,
 } from "@/shared/api/worldViewTypes";
 import { getMarkdownParseCount } from "@/shared/ui/markdown/nodeCache";
@@ -238,6 +240,9 @@ type E2eConfig = {
     worldViewBindings?: WorldViewBindingsDocument;
     worldViewThreadBindings?: Record<string, WorldViewBindingsDocument>;
     resolvedWorldViews?: Record<string, ResolvedWorldView>;
+    worldAuthorities?: WorldViewAuthority[];
+    worldViewCatalog?: WorldViewCatalog;
+    worldViewCatalogAfterHostedRegistration?: WorldViewCatalog;
     /** Delay (ms) for `apply_workspace` so e2e tests can observe the
      *  community-switch gate. 0/undefined = instant. */
     applyCommunityDelayMs?: number;
@@ -10984,7 +10989,7 @@ export function maybeInstallE2eTauriMocks() {
           ? (activeConfig?.mock?.worldViewThreadBindings?.[
               threadRootEventId
             ] ?? {
-              version: 2,
+              version: 4,
               scope: {
                 kind: "thread" as const,
                 threadRootEventId,
@@ -10992,7 +10997,7 @@ export function maybeInstallE2eTauriMocks() {
               bindings: [],
             })
           : (activeConfig?.mock?.worldViewBindings ?? {
-              version: 2,
+              version: 4,
               scope: { kind: "channel" as const },
               bindings: [],
             });
@@ -11020,7 +11025,7 @@ export function maybeInstallE2eTauriMocks() {
             }
           : null;
         const channelDocument = activeConfig?.mock?.worldViewBindings ?? {
-          version: 2,
+          version: 4,
           scope: { kind: "channel" as const },
           bindings: [],
         };
@@ -11059,6 +11064,76 @@ export function maybeInstallE2eTauriMocks() {
           ],
         };
       }
+      case "list_world_authorities": {
+        return {
+          authorities: activeConfig?.mock?.worldAuthorities ?? [],
+        };
+      }
+      case "connect_local_world_authority": {
+        const { sourceRoot } = payload as { sourceRoot: string };
+        return {
+          authority: {
+            origin: "https://manifest.shivai.space",
+            mirrorId: "mirror-buzz-main",
+            sourceRoot,
+          },
+          worldRef: {
+            kind: "local-world-mirror-latest",
+            origin: "https://manifest.shivai.space",
+            mirrorId: "mirror-buzz-main",
+          },
+        };
+      }
+      case "catalog_world_views": {
+        const hasRegisteredHostedAuthority =
+          window.__BUZZ_E2E_COMMANDS__?.includes(
+            "register_hosted_world_authority",
+          ) ?? false;
+        const configuredCatalog = hasRegisteredHostedAuthority
+          ? (activeConfig?.mock?.worldViewCatalogAfterHostedRegistration ??
+            activeConfig?.mock?.worldViewCatalog)
+          : activeConfig?.mock?.worldViewCatalog;
+        return (
+          configuredCatalog ?? {
+            formatVersion: 1,
+            revision: "revision-world-view-1",
+            worldQualifiedName: "world",
+            views: [
+              {
+                name: "@Board",
+                qualifiedName: "@main::Board",
+                realm: {
+                  name: "main",
+                  qualifiedName: "world::main",
+                },
+              },
+            ],
+          }
+        );
+      }
+      case "plugin:dialog|open": {
+        return "/workspace/buzz-integration.world";
+      }
+      case "publish_hosted_world_live_view_share": {
+        const { reference, viewQualifiedName } = payload as {
+          reference: {
+            kind: "hosted-world-latest";
+            origin: string;
+            hostedWorldId: string;
+          };
+          viewQualifiedName: string;
+        };
+        return {
+          hostedWorldId: reference.hostedWorldId,
+          sourceRevision: "hosted-revision-1",
+          packageRevision: "revision-world-view-1",
+          realmQualifiedName: "world::main",
+          viewQualifiedName,
+          shareToken: "public-live-view-token",
+          shareUrlPath: "/world/live/public-live-view-token",
+          title: "@Board",
+        };
+      }
       case "resolve_world_view": {
         const { request } = payload as {
           request: WorldViewResolutionRequest;
@@ -11072,14 +11147,20 @@ export function maybeInstallE2eTauriMocks() {
         }
         return resolved;
       }
-      case "register_local_world_authority": {
-        const authority = payload as {
-          origin: string;
-          mirrorId: string;
-          sourceRoot: string;
-        };
+      case "register_hosted_world_authority": {
         return {
-          authority,
+          authority: {
+            origin: "https://manifest.shivai.space",
+            hostedWorldId: "mock-hosted-world",
+            credentialFile:
+              "/tmp/buzz-world-authority-secrets/mock-hosted-world.edit-share",
+          },
+          revision: "revision-world-view-1",
+          worldRef: {
+            kind: "hosted-world-latest",
+            origin: "https://manifest.shivai.space",
+            hostedWorldId: "mock-hosted-world",
+          },
         };
       }
       // ── Local-save archive ──────────────────────────────────────────────

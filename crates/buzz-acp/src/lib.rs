@@ -3715,14 +3715,12 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
 }
 
 fn registered_local_world_writable_roots() -> Vec<String> {
-    use buzz_core::world_view::{
-        LocalWorldAuthorityRegistry, LOCAL_WORLD_AUTHORITY_REGISTRY_FILE_NAME,
-    };
+    use buzz_core::world_view::{WorldAuthorityRegistry, WORLD_AUTHORITY_REGISTRY_FILE_NAME};
 
     let Ok(cwd) = std::env::current_dir() else {
         return Vec::new();
     };
-    let path = cwd.join(LOCAL_WORLD_AUTHORITY_REGISTRY_FILE_NAME);
+    let path = cwd.join(WORLD_AUTHORITY_REGISTRY_FILE_NAME);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -3730,18 +3728,18 @@ fn registered_local_world_writable_roots() -> Vec<String> {
             tracing::warn!(
                 path = %path.display(),
                 %error,
-                "failed to read local world authority registry at agent startup",
+                "failed to read world authority registry at agent startup",
             );
             return Vec::new();
         }
     };
-    let registry: LocalWorldAuthorityRegistry = match serde_json::from_str(&text) {
+    let registry: WorldAuthorityRegistry = match serde_json::from_str(&text) {
         Ok(registry) => registry,
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
                 %error,
-                "local world authority registry contains invalid JSON at agent startup",
+                "world authority registry contains invalid JSON at agent startup",
             );
             return Vec::new();
         }
@@ -3750,12 +3748,12 @@ fn registered_local_world_writable_roots() -> Vec<String> {
         tracing::warn!(
             path = %path.display(),
             %error,
-            "local world authority registry failed validation at agent startup",
+            "world authority registry failed validation at agent startup",
         );
         return Vec::new();
     }
     registry
-        .authorities
+        .local_authorities
         .into_iter()
         .filter_map(|authority| {
             std::path::Path::new(&authority.source_root)

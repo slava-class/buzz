@@ -720,6 +720,47 @@ pub enum WorldViewsCmd {
         #[arg(long)]
         expected_revision: String,
     },
+    /// List connected local and hosted world sources without exposing credentials
+    Sources,
+    /// List authored views for one connected source
+    Catalog {
+        /// Source id from `buzz world-views sources` (`hosted:<id>` or `local:<id>`)
+        #[arg(long)]
+        source: String,
+        /// Exact Shivai origin from `buzz world-views sources`
+        #[arg(long)]
+        origin: String,
+    },
+    /// Bind one connected source and authored view with revision protection
+    Bind {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Exact thread-root event id; omit for a channel binding
+        #[arg(long)]
+        thread_root: Option<String>,
+        /// Source id from `buzz world-views sources` (`hosted:<id>` or `local:<id>`)
+        #[arg(long)]
+        source: String,
+        /// Exact Shivai origin from `buzz world-views sources`
+        #[arg(long)]
+        origin: String,
+        /// Qualified authored view name from `buzz world-views catalog`
+        #[arg(long)]
+        view: String,
+        /// Optional channel-authored label
+        #[arg(long)]
+        label: Option<String>,
+        /// Initial presentation: graph or tasks
+        #[arg(long, default_value = "graph")]
+        display: String,
+        /// Existing binding UUID to replace; omit to append or reuse an exact match
+        #[arg(long)]
+        binding: Option<String>,
+        /// Current event revision, or the literal `none` for first creation
+        #[arg(long)]
+        expected_revision: String,
+    },
     /// Resolve one binding into current normalized Shivai presentation JSON
     Resolve {
         /// Channel UUID

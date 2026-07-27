@@ -7,27 +7,29 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Current serialized scoped world-view binding document version.
-pub const WORLD_VIEW_BINDINGS_VERSION: u8 = 2;
+pub const WORLD_VIEW_BINDINGS_VERSION: u8 = 4;
 /// Maximum number of world views that one channel or thread scope may bind.
 pub const MAX_WORLD_VIEW_BINDINGS_PER_SCOPE: usize = 8;
 /// Canonical parameterized-replaceable coordinate for channel bindings.
 pub const CHANNEL_WORLD_VIEW_BINDINGS_D_TAG: &str = "world-view-bindings:channel";
-/// Current private local-world authority registry version.
-pub const LOCAL_WORLD_AUTHORITY_REGISTRY_VERSION: u8 = 1;
+/// Current private world-authority registry version.
+pub const WORLD_AUTHORITY_REGISTRY_VERSION: u8 = 2;
 /// Registry file shared by the desktop host and locally running ACP agents.
-pub const LOCAL_WORLD_AUTHORITY_REGISTRY_FILE_NAME: &str = "world-authorities.json";
+pub const WORLD_AUTHORITY_REGISTRY_FILE_NAME: &str = "world-authorities.json";
 
-/// Private machine-local mappings from public mirror identities to mutable sources.
+/// Private machine-local mappings from public world identities to mutation authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LocalWorldAuthorityRegistry {
+pub struct WorldAuthorityRegistry {
     /// Contract version for explicit forward evolution.
     pub version: u8,
-    /// One authoritative source per hosted mirror identity.
-    pub authorities: Vec<LocalWorldAuthority>,
+    /// Mutable local packages behind public mirror identities.
+    pub local_authorities: Vec<LocalWorldAuthority>,
+    /// Private hosted edit-share credentials behind public hosted-world identities.
+    pub hosted_authorities: Vec<HostedWorldAuthority>,
 }
 
-/// One private authority mapping. This shape must never be published to Nostr.
+/// One private local authority mapping. This shape must never be published to Nostr.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocalWorldAuthority {
@@ -39,34 +41,47 @@ pub struct LocalWorldAuthority {
     pub source_root: String,
 }
 
-impl Default for LocalWorldAuthorityRegistry {
+/// One private hosted authority mapping. This shape must never be published to Nostr.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedWorldAuthority {
+    /// Hosted Shivai origin that owns the world.
+    pub origin: String,
+    /// Stable public hosted-world identity.
+    pub hosted_world_id: String,
+    /// Canonical absolute path of the owner-only edit-share credential file.
+    pub credential_file: String,
+}
+
+impl Default for WorldAuthorityRegistry {
     fn default() -> Self {
         Self {
-            version: LOCAL_WORLD_AUTHORITY_REGISTRY_VERSION,
-            authorities: Vec::new(),
+            version: WORLD_AUTHORITY_REGISTRY_VERSION,
+            local_authorities: Vec::new(),
+            hosted_authorities: Vec::new(),
         }
     }
 }
 
-impl LocalWorldAuthorityRegistry {
-    /// Validate registry identity, path, and one-to-one mapping invariants.
+impl WorldAuthorityRegistry {
+    /// Validate registry identities, paths, and one-to-one mapping invariants.
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != LOCAL_WORLD_AUTHORITY_REGISTRY_VERSION {
+        if self.version != WORLD_AUTHORITY_REGISTRY_VERSION {
             return Err(format!(
-                "unsupported local world authority registry version: {}",
+                "unsupported world authority registry version: {}",
                 self.version
             ));
         }
-        let mut references = HashSet::with_capacity(self.authorities.len());
-        let mut roots = HashSet::with_capacity(self.authorities.len());
-        for authority in &self.authorities {
+        let mut local_references = HashSet::with_capacity(self.local_authorities.len());
+        let mut roots = HashSet::with_capacity(self.local_authorities.len());
+        for authority in &self.local_authorities {
             validate_hosted_origin(&authority.origin)?;
             validate_required_text("mirrorId", &authority.mirror_id, 1024)?;
             validate_required_text("sourceRoot", &authority.source_root, 4096)?;
             if !std::path::Path::new(&authority.source_root).is_absolute() {
                 return Err("sourceRoot must be an absolute path".into());
             }
-            if !references.insert((&authority.origin, &authority.mirror_id)) {
+            if !local_references.insert((&authority.origin, &authority.mirror_id)) {
                 return Err(format!(
                     "duplicate local world authority: {} {}",
                     authority.origin, authority.mirror_id
@@ -79,25 +94,73 @@ impl LocalWorldAuthorityRegistry {
                 ));
             }
         }
+
+        let mut hosted_references = HashSet::with_capacity(self.hosted_authorities.len());
+        let mut credential_files = HashSet::with_capacity(self.hosted_authorities.len());
+        for authority in &self.hosted_authorities {
+            validate_hosted_origin(&authority.origin)?;
+            validate_required_text("hostedWorldId", &authority.hosted_world_id, 1024)?;
+            validate_required_text("credentialFile", &authority.credential_file, 4096)?;
+            if !std::path::Path::new(&authority.credential_file).is_absolute() {
+                return Err("credentialFile must be an absolute path".into());
+            }
+            if !hosted_references.insert((&authority.origin, &authority.hosted_world_id)) {
+                return Err(format!(
+                    "duplicate hosted world authority: {} {}",
+                    authority.origin, authority.hosted_world_id
+                ));
+            }
+            if !credential_files.insert(&authority.credential_file) {
+                return Err(format!(
+                    "duplicate hosted world credential file: {}",
+                    authority.credential_file
+                ));
+            }
+        }
         Ok(())
     }
 
     /// Resolve mutable local authority for one public mirror reference.
-    pub fn resolve(&self, origin: &str, mirror_id: &str) -> Option<&LocalWorldAuthority> {
-        self.authorities
+    pub fn resolve_local(&self, origin: &str, mirror_id: &str) -> Option<&LocalWorldAuthority> {
+        self.local_authorities
             .iter()
             .find(|authority| authority.origin == origin && authority.mirror_id == mirror_id)
     }
 
-    /// Replace mappings that share either identity or local source, then validate.
-    pub fn upsert(&mut self, authority: LocalWorldAuthority) -> Result<(), String> {
-        self.authorities.retain(|candidate| {
+    /// Resolve mutable hosted authority for one public hosted-world reference.
+    pub fn resolve_hosted(
+        &self,
+        origin: &str,
+        hosted_world_id: &str,
+    ) -> Option<&HostedWorldAuthority> {
+        self.hosted_authorities.iter().find(|authority| {
+            authority.origin == origin && authority.hosted_world_id == hosted_world_id
+        })
+    }
+
+    /// Replace local mappings that share either identity or source, then validate.
+    pub fn upsert_local(&mut self, authority: LocalWorldAuthority) -> Result<(), String> {
+        self.local_authorities.retain(|candidate| {
             (candidate.origin != authority.origin || candidate.mirror_id != authority.mirror_id)
                 && candidate.source_root != authority.source_root
         });
-        self.authorities.push(authority);
-        self.authorities.sort_by(|left, right| {
+        self.local_authorities.push(authority);
+        self.local_authorities.sort_by(|left, right| {
             (&left.origin, &left.mirror_id).cmp(&(&right.origin, &right.mirror_id))
+        });
+        self.validate()
+    }
+
+    /// Replace hosted mappings that share either identity or credential, then validate.
+    pub fn upsert_hosted(&mut self, authority: HostedWorldAuthority) -> Result<(), String> {
+        self.hosted_authorities.retain(|candidate| {
+            (candidate.origin != authority.origin
+                || candidate.hosted_world_id != authority.hosted_world_id)
+                && candidate.credential_file != authority.credential_file
+        });
+        self.hosted_authorities.push(authority);
+        self.hosted_authorities.sort_by(|left, right| {
+            (&left.origin, &left.hosted_world_id).cmp(&(&right.origin, &right.hosted_world_id))
         });
         self.validate()
     }
@@ -449,6 +512,55 @@ pub enum WorldViewReference {
         #[serde(rename = "shareToken")]
         share_token: String,
     },
+    /// A stable public view capability that follows the hosted world's latest revision.
+    HostedWorldLiveViewShare {
+        /// Hosted Shivai origin serving the public live view.
+        origin: String,
+        /// Stable public read-only live-view share token.
+        #[serde(rename = "shareToken")]
+        share_token: String,
+    },
+    /// The latest projection of a hosted world, authorized privately on each client.
+    HostedWorldLatest {
+        /// Hosted Shivai origin serving and mutating the world.
+        origin: String,
+        /// Stable public hosted-world identity.
+        #[serde(rename = "hostedWorldId")]
+        hosted_world_id: String,
+    },
+}
+
+impl WorldViewReference {
+    /// Validate one public source identity without requiring a bound realm/view.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::LocalWorldMirrorLatest { origin, mirror_id } => {
+                validate_hosted_origin(origin)?;
+                validate_required_text("reference.mirrorId", mirror_id, 1024)
+            }
+            Self::HostedWorldViewExport {
+                origin,
+                share_token,
+            } => {
+                validate_hosted_origin(origin)?;
+                validate_required_text("reference.shareToken", share_token, 1024)
+            }
+            Self::HostedWorldLiveViewShare {
+                origin,
+                share_token,
+            } => {
+                validate_hosted_origin(origin)?;
+                validate_required_text("reference.shareToken", share_token, 1024)
+            }
+            Self::HostedWorldLatest {
+                origin,
+                hosted_world_id,
+            } => {
+                validate_hosted_origin(origin)?;
+                validate_required_text("reference.hostedWorldId", hosted_world_id, 1024)
+            }
+        }
+    }
 }
 
 /// Initial channel presentation for a bound world view.
@@ -487,19 +599,7 @@ impl WorldViewBindingsDocument {
             if let Some(label) = &binding.label {
                 validate_required_text("label", label, 160)?;
             }
-            match &binding.reference {
-                WorldViewReference::LocalWorldMirrorLatest { origin, mirror_id } => {
-                    validate_hosted_origin(origin)?;
-                    validate_required_text("reference.mirrorId", mirror_id, 1024)?;
-                }
-                WorldViewReference::HostedWorldViewExport {
-                    origin,
-                    share_token,
-                } => {
-                    validate_hosted_origin(origin)?;
-                    validate_required_text("reference.shareToken", share_token, 1024)?;
-                }
-            }
+            binding.reference.validate()?;
         }
         Ok(())
     }
@@ -797,32 +897,56 @@ mod tests {
     }
 
     #[test]
-    fn local_authority_registry_upsert_preserves_one_to_one_mappings() {
-        let mut registry = LocalWorldAuthorityRegistry::default();
+    fn world_authority_registry_preserves_one_to_one_mappings() {
+        let mut registry = WorldAuthorityRegistry::default();
         registry
-            .upsert(LocalWorldAuthority {
+            .upsert_local(LocalWorldAuthority {
                 origin: "https://manifest.shivai.space".into(),
                 mirror_id: "mirror-1".into(),
                 source_root: "/worlds/one.world".into(),
             })
             .unwrap();
         registry
-            .upsert(LocalWorldAuthority {
+            .upsert_local(LocalWorldAuthority {
                 origin: "https://manifest.shivai.space".into(),
                 mirror_id: "mirror-2".into(),
                 source_root: "/worlds/one.world".into(),
             })
             .unwrap();
+        registry
+            .upsert_hosted(HostedWorldAuthority {
+                origin: "https://manifest.shivai.space".into(),
+                hosted_world_id: "hosted-1".into(),
+                credential_file: "/credentials/one.txt".into(),
+            })
+            .unwrap();
+        registry
+            .upsert_hosted(HostedWorldAuthority {
+                origin: "https://manifest.shivai.space".into(),
+                hosted_world_id: "hosted-2".into(),
+                credential_file: "/credentials/one.txt".into(),
+            })
+            .unwrap();
 
-        assert_eq!(registry.authorities.len(), 1);
+        assert_eq!(registry.local_authorities.len(), 1);
         assert!(registry
-            .resolve("https://manifest.shivai.space", "mirror-1")
+            .resolve_local("https://manifest.shivai.space", "mirror-1")
             .is_none());
         assert_eq!(
             registry
-                .resolve("https://manifest.shivai.space", "mirror-2")
+                .resolve_local("https://manifest.shivai.space", "mirror-2")
                 .map(|authority| authority.source_root.as_str()),
             Some("/worlds/one.world")
+        );
+        assert_eq!(registry.hosted_authorities.len(), 1);
+        assert!(registry
+            .resolve_hosted("https://manifest.shivai.space", "hosted-1")
+            .is_none());
+        assert_eq!(
+            registry
+                .resolve_hosted("https://manifest.shivai.space", "hosted-2")
+                .map(|authority| authority.credential_file.as_str()),
+            Some("/credentials/one.txt")
         );
     }
 

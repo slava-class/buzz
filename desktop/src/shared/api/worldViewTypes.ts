@@ -8,23 +8,84 @@ export type WorldViewReference =
       mirrorId: string;
     }
   | {
+      kind: "hosted-world-latest";
+      origin: string;
+      hostedWorldId: string;
+    }
+  | {
       kind: "hosted-world-view-export";
+      origin: string;
+      shareToken: string;
+    }
+  | {
+      kind: "hosted-world-live-view-share";
       origin: string;
       shareToken: string;
     };
 
-export type RegisterLocalWorldAuthorityInput = {
-  origin: string;
-  mirrorId: string;
+export type WorldViewAuthority =
+  | (Extract<WorldViewReference, { kind: "local-world-mirror-latest" }> & {
+      sourceRoot: string;
+    })
+  | Extract<WorldViewReference, { kind: "hosted-world-latest" }>;
+
+export type WorldViewAuthorityListResult = {
+  authorities: WorldViewAuthority[];
+};
+
+export type ConnectLocalWorldAuthorityInput = {
   sourceRoot: string;
 };
 
-export type RegisterLocalWorldAuthorityResult = {
+export type ConnectLocalWorldAuthorityResult = {
   authority: {
     origin: string;
     mirrorId: string;
     sourceRoot: string;
   };
+  worldRef: Extract<WorldViewReference, { kind: "local-world-mirror-latest" }>;
+};
+
+export type WorldViewCatalogEntry = {
+  name: string;
+  qualifiedName: string;
+  realm: {
+    name: string;
+    qualifiedName: string;
+  };
+};
+
+export type WorldViewCatalog = {
+  formatVersion: 1;
+  revision: string;
+  worldQualifiedName: string;
+  views: WorldViewCatalogEntry[];
+};
+
+export type RegisterHostedWorldAuthorityInput = {
+  origin: string;
+  credential: string;
+};
+
+export type RegisterHostedWorldAuthorityResult = {
+  authority: {
+    origin: string;
+    hostedWorldId: string;
+    credentialFile: string;
+  };
+  revision: string;
+  worldRef: Extract<WorldViewReference, { kind: "hosted-world-latest" }>;
+};
+
+export type PublishedHostedWorldLiveViewShare = {
+  hostedWorldId: string;
+  sourceRevision: string;
+  packageRevision: string;
+  realmQualifiedName: string;
+  viewQualifiedName: string;
+  shareToken: string;
+  shareUrlPath: string;
+  title: string;
 };
 
 export type WorldViewBindingScope =
@@ -41,7 +102,7 @@ export type WorldViewBinding = {
 };
 
 export type WorldViewBindingsDocument = {
-  version: 2;
+  version: 4;
   scope: WorldViewBindingScope;
   bindings: WorldViewBinding[];
 };
@@ -96,18 +157,83 @@ const worldViewBindingScopeSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
+const localWorldMirrorLatestReferenceSchema = z.strictObject({
+  kind: z.literal("local-world-mirror-latest"),
+  origin: z.url(),
+  mirrorId: z.string().min(1),
+});
+
+const hostedWorldLatestReferenceSchema = z.strictObject({
+  kind: z.literal("hosted-world-latest"),
+  origin: z.url(),
+  hostedWorldId: z.string().min(1),
+});
+
+const hostedWorldViewExportReferenceSchema = z.strictObject({
+  kind: z.literal("hosted-world-view-export"),
+  origin: z.url(),
+  shareToken: z.string().min(1),
+});
+
+const hostedWorldLiveViewShareReferenceSchema = z.strictObject({
+  kind: z.literal("hosted-world-live-view-share"),
+  origin: z.url(),
+  shareToken: z.string().min(1),
+});
+
 const worldViewReferenceSchema = z.discriminatedUnion("kind", [
-  z.strictObject({
-    kind: z.literal("local-world-mirror-latest"),
+  localWorldMirrorLatestReferenceSchema,
+  hostedWorldLatestReferenceSchema,
+  hostedWorldViewExportReferenceSchema,
+  hostedWorldLiveViewShareReferenceSchema,
+]);
+
+const worldViewAuthorityListResultSchema = z.strictObject({
+  authorities: z.array(
+    z.discriminatedUnion("kind", [
+      localWorldMirrorLatestReferenceSchema.extend({
+        sourceRoot: z.string().min(1),
+      }),
+      hostedWorldLatestReferenceSchema,
+    ]),
+  ),
+});
+
+const connectLocalWorldAuthorityResultSchema = z.strictObject({
+  authority: z.strictObject({
     origin: z.url(),
     mirrorId: z.string().min(1),
+    sourceRoot: z.string().min(1),
   }),
-  z.strictObject({
-    kind: z.literal("hosted-world-view-export"),
-    origin: z.url(),
-    shareToken: z.string().min(1),
-  }),
-]);
+  worldRef: localWorldMirrorLatestReferenceSchema,
+});
+
+const worldViewCatalogSchema = z.strictObject({
+  formatVersion: z.literal(1),
+  revision: z.string().min(1),
+  worldQualifiedName: z.string().min(1),
+  views: z.array(
+    z.strictObject({
+      name: z.string().min(1),
+      qualifiedName: z.string().min(1),
+      realm: z.strictObject({
+        name: z.string().min(1),
+        qualifiedName: z.string().min(1),
+      }),
+    }),
+  ),
+});
+
+const publishedHostedWorldLiveViewShareSchema = z.strictObject({
+  hostedWorldId: z.string().min(1),
+  sourceRevision: z.string().min(1),
+  packageRevision: z.string().min(1),
+  realmQualifiedName: z.string().min(1),
+  viewQualifiedName: z.string().min(1),
+  shareToken: z.string().min(1),
+  shareUrlPath: z.string().min(1),
+  title: z.string().min(1),
+});
 
 const worldViewBindingSchema = z.strictObject({
   id: z.uuid(),
@@ -258,8 +384,18 @@ const resolvedWorldViewSchema = z.strictObject({
   freshness: z.enum(["pinned", "latest-at-resolution"]),
   authority: z.discriminatedUnion("kind", [
     z.strictObject({
+      kind: z.literal("hosted-world-latest"),
+      origin: z.url(),
+      hostedWorldId: z.string().min(1),
+    }),
+    z.strictObject({
       kind: z.literal("hosted-world-view-export"),
       origin: z.url(),
+    }),
+    z.strictObject({
+      kind: z.literal("hosted-world-live-view-share"),
+      origin: z.url(),
+      hostedWorldId: z.string().min(1),
     }),
     z.strictObject({
       kind: z.literal("local-world-mirror-latest"),
@@ -306,6 +442,28 @@ type PresentationContractCheck =
     : never;
 const presentationContractCheck: PresentationContractCheck = true;
 void presentationContractCheck;
+
+export function decodeWorldViewAuthorityList(
+  value: unknown,
+): WorldViewAuthorityListResult {
+  return worldViewAuthorityListResultSchema.parse(value);
+}
+
+export function decodeConnectLocalWorldAuthorityResult(
+  value: unknown,
+): ConnectLocalWorldAuthorityResult {
+  return connectLocalWorldAuthorityResultSchema.parse(value);
+}
+
+export function decodeWorldViewCatalog(value: unknown): WorldViewCatalog {
+  return worldViewCatalogSchema.parse(value);
+}
+
+export function decodePublishedHostedWorldLiveViewShare(
+  value: unknown,
+): PublishedHostedWorldLiveViewShare {
+  return publishedHostedWorldLiveViewShareSchema.parse(value);
+}
 
 export function decodeResolvedWorldView(value: unknown): ResolvedWorldView {
   return resolvedWorldViewSchema.parse(value);

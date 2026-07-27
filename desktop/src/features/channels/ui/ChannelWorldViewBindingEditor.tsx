@@ -1,26 +1,47 @@
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import {
+  Check,
+  Cloud,
+  FolderOpen,
+  Link2,
+  LoaderCircle,
+  Network,
+} from "lucide-react";
 import * as React from "react";
 
-import { useRegisterLocalWorldAuthorityMutation } from "@/features/channels/hooks";
-import { parseShareableWorldViewDescriptor } from "@/features/channels/worldViewDescriptor";
+import {
+  useConnectLocalWorldAuthorityMutation,
+  useRegisterHostedWorldAuthorityMutation,
+  usePublishHostedWorldLiveViewShareMutation,
+  useWorldAuthoritiesQuery,
+  useWorldViewCatalogQuery,
+} from "@/features/channels/hooks";
+import { parsePublicWorldViewReference } from "@/features/channels/worldViewDescriptor";
 import type {
+  WorldViewAuthority,
   WorldViewBinding,
   WorldViewBindingScope,
   WorldViewBindingsDocument,
+  WorldViewCatalog,
+  WorldViewCatalogEntry,
+  WorldViewReference,
 } from "@/shared/api/worldViewTypes";
+import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
 
+const DEFAULT_SHIVAI_ORIGIN = "https://manifest.shivai.space";
+
 type WorldViewBindingEditorState = {
-  descriptor: string;
-  descriptorError: string | null;
   displayMode: WorldViewBinding["displayMode"];
+  hostedCredential: string;
+  isHostedConnectionOpen: boolean;
   label: string;
-  localSourceRoot: string;
-  origin: string;
-  realmQualifiedName: string;
-  sourceKind: WorldViewBinding["reference"]["kind"];
-  sourceValue: string;
-  viewQualifiedName: string;
+  publicReference: string;
+  publicReferenceError: string | null;
+  reference: WorldViewReference | null;
+  selectedViewQualifiedName: string;
+  sourceError: string | null;
 };
 
 type WorldViewBindingEditorAction = {
@@ -32,19 +53,15 @@ function createWorldViewBindingEditorState(
   binding: WorldViewBinding | null,
 ): WorldViewBindingEditorState {
   return {
-    descriptor: "",
-    descriptorError: null,
     displayMode: binding?.displayMode ?? "graph",
+    hostedCredential: "",
+    isHostedConnectionOpen: false,
     label: binding?.label ?? "",
-    localSourceRoot: "",
-    origin: binding?.reference.origin ?? "https://manifest.shivai.space",
-    realmQualifiedName: binding?.realmQualifiedName ?? "",
-    sourceKind: binding?.reference.kind ?? "local-world-mirror-latest",
-    sourceValue:
-      binding?.reference.kind === "local-world-mirror-latest"
-        ? binding.reference.mirrorId
-        : (binding?.reference.shareToken ?? ""),
-    viewQualifiedName: binding?.viewQualifiedName ?? "",
+    publicReference: "",
+    publicReferenceError: null,
+    reference: binding?.reference ?? null,
+    selectedViewQualifiedName: binding?.viewQualifiedName ?? "",
+    sourceError: null,
   };
 }
 
@@ -53,6 +70,60 @@ function worldViewBindingEditorReducer(
   action: WorldViewBindingEditorAction,
 ): WorldViewBindingEditorState {
   return { ...state, ...action.value };
+}
+
+function worldViewReferenceKey(reference: WorldViewReference): string {
+  switch (reference.kind) {
+    case "local-world-mirror-latest":
+      return `${reference.kind}:${reference.origin}:${reference.mirrorId}`;
+    case "hosted-world-latest":
+      return `${reference.kind}:${reference.origin}:${reference.hostedWorldId}`;
+    case "hosted-world-view-export":
+    case "hosted-world-live-view-share":
+      return `${reference.kind}:${reference.origin}:${reference.shareToken}`;
+  }
+}
+
+function worldViewReferencesEqual(
+  left: WorldViewReference | null,
+  right: WorldViewReference,
+): boolean {
+  return (
+    left !== null &&
+    worldViewReferenceKey(left) === worldViewReferenceKey(right)
+  );
+}
+
+function publicWorldViewReference(
+  authority: WorldViewAuthority,
+): WorldViewReference {
+  switch (authority.kind) {
+    case "local-world-mirror-latest":
+      return {
+        kind: authority.kind,
+        origin: authority.origin,
+        mirrorId: authority.mirrorId,
+      };
+    case "hosted-world-latest":
+      return {
+        kind: authority.kind,
+        origin: authority.origin,
+        hostedWorldId: authority.hostedWorldId,
+      };
+  }
+}
+
+function localWorldName(sourceRoot: string): string {
+  const segments = sourceRoot.replaceAll("\\", "/").split("/");
+  return segments.at(-1) || "Local world";
+}
+
+function hostedCredentialOrigin(credential: string): string {
+  try {
+    return new URL(credential).origin;
+  } catch {
+    return DEFAULT_SHIVAI_ORIGIN;
+  }
 }
 
 export type ChannelWorldViewBindingEditorProps = {
@@ -74,95 +145,131 @@ export function ChannelWorldViewBindingEditor({
   onPublish,
   publishError,
 }: ChannelWorldViewBindingEditorProps) {
-  const authorityMutation = useRegisterLocalWorldAuthorityMutation();
+  const authoritiesQuery = useWorldAuthoritiesQuery();
+  const localAuthorityMutation = useConnectLocalWorldAuthorityMutation();
+  const hostedAuthorityMutation = useRegisterHostedWorldAuthorityMutation();
+  const liveViewShareMutation = usePublishHostedWorldLiveViewShareMutation();
   const [state, dispatch] = React.useReducer(
     worldViewBindingEditorReducer,
     createWorldViewBindingEditorState(binding),
   );
-  const descriptorInputId = React.useId();
-  const originInputId = React.useId();
-  const sourceValueInputId = React.useId();
-  const localSourceRootInputId = React.useId();
-  const realmQualifiedNameInputId = React.useId();
-  const viewQualifiedNameInputId = React.useId();
-  const labelInputId = React.useId();
-  const reusesLocalReference =
-    state.sourceKind === "local-world-mirror-latest" &&
-    binding?.reference.kind === "local-world-mirror-latest" &&
-    binding.reference.origin === state.origin.trim() &&
-    binding.reference.mirrorId === state.sourceValue.trim();
-  const localSourceRootRequired =
-    state.sourceKind === "local-world-mirror-latest" && !reusesLocalReference;
+  const catalogQuery = useWorldViewCatalogQuery(state.reference);
+  const selectedView = catalogQuery.data?.views.find(
+    (view) => view.qualifiedName === state.selectedViewQualifiedName,
+  );
+  const authorities = authoritiesQuery.data?.authorities ?? [];
+  const isBusy =
+    isPublishing ||
+    localAuthorityMutation.isPending ||
+    hostedAuthorityMutation.isPending ||
+    liveViewShareMutation.isPending;
+
+  React.useEffect(() => {
+    const firstView = catalogQuery.data?.views[0];
+    if (state.selectedViewQualifiedName || !firstView) return;
+    dispatch({
+      type: "patch",
+      value: {
+        selectedViewQualifiedName: firstView.qualifiedName,
+      },
+    });
+  }, [catalogQuery.data, state.selectedViewQualifiedName]);
 
   function patch(value: Partial<WorldViewBindingEditorState>): void {
     dispatch({ type: "patch", value });
   }
 
-  function handleUseDescriptor(): void {
-    const parsed = parseShareableWorldViewDescriptor(state.descriptor);
+  function selectReference(
+    reference: WorldViewReference,
+    selectedViewQualifiedName = "",
+  ): void {
+    patch({
+      publicReferenceError: null,
+      reference,
+      selectedViewQualifiedName,
+      sourceError: null,
+    });
+  }
+
+  function handleUsePublicReference(): void {
+    const parsed = parsePublicWorldViewReference(state.publicReference);
     if (!parsed.ok) {
-      patch({ descriptorError: parsed.error });
+      patch({ publicReferenceError: parsed.error });
       return;
     }
-    patch({
-      descriptorError: null,
-      localSourceRoot: "",
-      origin: parsed.value.reference.origin,
-      realmQualifiedName: parsed.value.realmQualifiedName,
-      sourceKind: parsed.value.reference.kind,
-      sourceValue: parsed.value.reference.shareToken,
-      viewQualifiedName: parsed.value.viewQualifiedName,
-    });
+    selectReference(
+      parsed.value.reference,
+      parsed.value.selection?.viewQualifiedName,
+    );
+  }
+
+  async function handleConnectLocalWorld(): Promise<void> {
+    patch({ sourceError: null });
+    try {
+      const sourceRoot = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Choose a published Shivai world",
+      });
+      if (typeof sourceRoot !== "string") return;
+      const result = await localAuthorityMutation.mutateAsync({ sourceRoot });
+      selectReference(result.worldRef);
+    } catch (error) {
+      patch({
+        sourceError:
+          error instanceof Error
+            ? error.message
+            : "Could not connect local world.",
+      });
+    }
+  }
+
+  async function handleConnectHostedWorld(): Promise<void> {
+    const credential = state.hostedCredential.trim();
+    if (!credential) return;
+    patch({ sourceError: null });
+    try {
+      const result = await hostedAuthorityMutation.mutateAsync({
+        credential,
+        origin: hostedCredentialOrigin(credential),
+      });
+      patch({
+        hostedCredential: "",
+        isHostedConnectionOpen: false,
+      });
+      selectReference(result.worldRef);
+    } catch {
+      // The mutation owns the user-visible error state.
+    }
   }
 
   async function handleSubmit(
     event: React.FormEvent<HTMLFormElement>,
   ): Promise<void> {
     event.preventDefault();
-    const normalizedOrigin = state.origin.trim();
-    const normalizedSourceValue = state.sourceValue.trim();
-    const normalizedRealm = state.realmQualifiedName.trim();
-    const normalizedView = state.viewQualifiedName.trim();
-    if (
-      !normalizedOrigin ||
-      !normalizedSourceValue ||
-      !normalizedRealm ||
-      !normalizedView
-    ) {
-      return;
-    }
+    if (!state.reference || !selectedView) return;
 
-    const reference: WorldViewBinding["reference"] =
-      state.sourceKind === "local-world-mirror-latest"
-        ? {
-            kind: "local-world-mirror-latest",
-            origin: normalizedOrigin,
-            mirrorId: normalizedSourceValue,
-          }
-        : {
-            kind: "hosted-world-view-export",
-            origin: normalizedOrigin,
-            shareToken: normalizedSourceValue,
-          };
-    if (
-      reference.kind === "local-world-mirror-latest" &&
-      !reusesLocalReference
-    ) {
-      const normalizedLocalSourceRoot = state.localSourceRoot.trim();
-      if (!normalizedLocalSourceRoot) return;
-      await authorityMutation.mutateAsync({
-        origin: reference.origin,
-        mirrorId: reference.mirrorId,
-        sourceRoot: normalizedLocalSourceRoot,
-      });
-    }
-
+    const publicReference =
+      state.reference.kind === "hosted-world-latest"
+        ? await liveViewShareMutation
+            .mutateAsync({
+              reference: state.reference,
+              viewQualifiedName: selectedView.qualifiedName,
+            })
+            .then(
+              (share): WorldViewReference => ({
+                kind: "hosted-world-live-view-share",
+                origin: state.reference?.origin ?? DEFAULT_SHIVAI_ORIGIN,
+                shareToken: share.shareToken,
+              }),
+            )
+        : state.reference;
     const nextBinding: WorldViewBinding = {
       id: binding?.id ?? crypto.randomUUID(),
       ...(state.label.trim() ? { label: state.label.trim() } : {}),
-      reference,
-      realmQualifiedName: normalizedRealm,
-      viewQualifiedName: normalizedView,
+      reference: publicReference,
+      realmQualifiedName: selectedView.realm.qualifiedName,
+      viewQualifiedName: selectedView.qualifiedName,
       displayMode: state.displayMode,
     };
     const replacesExactBinding = bindings.some(
@@ -174,219 +281,484 @@ export function ChannelWorldViewBindingEditor({
         )
       : [...bindings, nextBinding];
     await onPublish({
-      version: 2,
+      version: 4,
       scope: bindingScope,
       bindings: nextBindings,
     });
     onComplete();
   }
 
+  const mutationError =
+    localAuthorityMutation.error instanceof Error
+      ? localAuthorityMutation.error
+      : hostedAuthorityMutation.error instanceof Error
+        ? hostedAuthorityMutation.error
+        : liveViewShareMutation.error instanceof Error
+          ? liveViewShareMutation.error
+          : null;
+  const queryError =
+    authoritiesQuery.error instanceof Error
+      ? authoritiesQuery.error
+      : catalogQuery.error instanceof Error
+        ? catalogQuery.error
+        : null;
+  const submitLabel = binding
+    ? "Save view"
+    : bindingScope.kind === "thread"
+      ? "Share in this thread"
+      : "Share in this channel";
+
   return (
     <form
-      className="grid gap-2 rounded-xl border border-border/70 bg-background/70 p-3"
+      className="mx-auto grid w-full max-w-3xl gap-4 rounded-2xl border border-border/70 bg-background/90 p-4 shadow-xl shadow-black/10"
       onSubmit={(event) => void handleSubmit(event)}
     >
-      <div className="grid gap-1 rounded-lg border border-border/60 bg-muted/20 p-2">
-        <label
-          className="text-2xs font-medium text-muted-foreground"
-          htmlFor={descriptorInputId}
-        >
-          Paste Shivai view reference
-        </label>
-        <textarea
-          className="min-h-24 resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs text-foreground"
-          id={descriptorInputId}
-          onChange={(event) =>
+      <header className="flex items-start gap-3">
+        <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-primary/20 bg-primary/10 text-primary shadow-sm">
+          <Network className="h-5 w-5" />
+        </span>
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold text-foreground">
+            {binding ? "Edit Shivai view" : "Add Shivai view"}
+          </h3>
+          <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+            Choose a world connected to this device, then select the view to
+            share with this conversation.
+          </p>
+        </div>
+      </header>
+
+      <WorldSourcePicker
+        actions={{
+          onConnectHostedWorld: handleConnectHostedWorld,
+          onConnectLocalWorld: handleConnectLocalWorld,
+          onHostedCredentialChange: (hostedCredential) =>
+            patch({ hostedCredential }),
+          onPublicReferenceChange: (publicReference) =>
+            patch({ publicReference, publicReferenceError: null }),
+          onSelectReference: selectReference,
+          onToggleHostedConnection: () =>
             patch({
-              descriptor: event.target.value,
-              descriptorError: null,
-            })
-          }
-          placeholder={
-            'Shivai view reference\nSource: hosted view export "..."\nRealm: world::main\nView qualified: world::main::@Board'
-          }
-          value={state.descriptor}
-        />
+              isHostedConnectionOpen: !state.isHostedConnectionOpen,
+              sourceError: null,
+            }),
+          onUsePublicReference: handleUsePublicReference,
+        }}
+        model={{
+          authorities,
+          hostedCredential: state.hostedCredential,
+          isBusy,
+          isFetchingAuthorities: authoritiesQuery.isFetching,
+          isHostedConnecting: hostedAuthorityMutation.isPending,
+          isHostedConnectionOpen: state.isHostedConnectionOpen,
+          publicReference: state.publicReference,
+          publicReferenceError: state.publicReferenceError,
+          reference: state.reference,
+        }}
+      />
+
+      <WorldViewSettings
+        actions={{
+          onDisplayModeChange: (displayMode) => patch({ displayMode }),
+          onLabelChange: (label) => patch({ label }),
+          onViewChange: (selectedViewQualifiedName) =>
+            patch({ selectedViewQualifiedName }),
+        }}
+        model={{
+          catalog: catalogQuery.data,
+          displayMode: state.displayMode,
+          isCatalogFetching: catalogQuery.isFetching,
+          label: state.label,
+          referenceSelected: state.reference !== null,
+          selectedView,
+          selectedViewQualifiedName: state.selectedViewQualifiedName,
+        }}
+      />
+
+      {state.sourceError ? (
+        <p className="text-xs text-destructive">{state.sourceError}</p>
+      ) : mutationError ? (
+        <p className="text-xs text-destructive">{mutationError.message}</p>
+      ) : queryError ? (
+        <p className="text-xs text-destructive">{queryError.message}</p>
+      ) : publishError ? (
+        <p className="text-xs text-destructive">{publishError.message}</p>
+      ) : null}
+
+      <footer className="flex flex-col-reverse gap-2 border-t border-border/60 pt-3 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          Private paths and edit credentials remain on this device.
+        </p>
+        <Button
+          className="shrink-0"
+          disabled={isBusy || !state.reference || !selectedView}
+          size="sm"
+          type="submit"
+        >
+          {isBusy ? "Sharing..." : submitLabel}
+        </Button>
+      </footer>
+    </form>
+  );
+}
+
+type WorldSourcePickerModel = {
+  authorities: readonly WorldViewAuthority[];
+  hostedCredential: string;
+  isBusy: boolean;
+  isFetchingAuthorities: boolean;
+  isHostedConnecting: boolean;
+  isHostedConnectionOpen: boolean;
+  publicReference: string;
+  publicReferenceError: string | null;
+  reference: WorldViewReference | null;
+};
+
+type WorldSourcePickerActions = {
+  onConnectHostedWorld: () => Promise<void>;
+  onConnectLocalWorld: () => Promise<void>;
+  onHostedCredentialChange: (value: string) => void;
+  onPublicReferenceChange: (value: string) => void;
+  onSelectReference: (reference: WorldViewReference) => void;
+  onToggleHostedConnection: () => void;
+  onUsePublicReference: () => void;
+};
+
+type WorldSourcePickerProps = {
+  actions: WorldSourcePickerActions;
+  model: WorldSourcePickerModel;
+};
+
+function WorldSourcePicker({ actions, model }: WorldSourcePickerProps) {
+  const hostedCredentialInputId = React.useId();
+  const publicReferenceInputId = React.useId();
+  const selectedReferenceIsShared =
+    model.reference?.kind === "hosted-world-view-export" ||
+    model.reference?.kind === "hosted-world-live-view-share";
+
+  return (
+    <>
+      <section className="grid gap-2">
         <div className="flex items-center justify-between gap-3">
-          <span className="text-3xs leading-relaxed text-muted-foreground">
-            Local paths and edit-share capabilities are rejected before
-            publication.
-          </span>
+          <h4 className="text-2xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Connected worlds
+          </h4>
+          {model.isFetchingAuthorities ? (
+            <LoaderCircle className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+          ) : null}
+        </div>
+        <div className="overflow-hidden rounded-xl border border-border/70 bg-muted/20">
+          {model.authorities.length === 0 && !selectedReferenceIsShared ? (
+            <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+              No worlds are connected to this device yet.
+            </p>
+          ) : (
+            <div className="divide-y divide-border/60">
+              {model.authorities.map((authority) => {
+                const reference = publicWorldViewReference(authority);
+                return (
+                  <WorldAuthorityChoice
+                    authority={authority}
+                    isSelected={worldViewReferencesEqual(
+                      model.reference,
+                      reference,
+                    )}
+                    key={worldViewReferenceKey(reference)}
+                    onSelect={() => actions.onSelectReference(reference)}
+                  />
+                );
+              })}
+              {selectedReferenceIsShared ? (
+                <button
+                  aria-pressed="true"
+                  className="flex w-full items-center gap-3 bg-primary/5 px-3 py-2.5 text-left"
+                  type="button"
+                >
+                  <span className="grid h-8 w-8 place-items-center rounded-lg bg-blue-9/10 text-blue-11">
+                    <Link2 className="h-4 w-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium text-foreground">
+                      {model.reference?.kind === "hosted-world-live-view-share"
+                        ? "Shared live read-only view"
+                        : "Shared pinned read-only view"}
+                    </span>
+                    <span className="block truncate text-3xs text-muted-foreground">
+                      {model.reference?.origin}
+                    </span>
+                  </span>
+                  <Check className="h-4 w-4 text-primary" />
+                </button>
+              ) : null}
+            </div>
+          )}
+        </div>
+        <div className="grid gap-2 sm:grid-cols-2">
           <Button
-            disabled={!state.descriptor.trim()}
-            onClick={handleUseDescriptor}
+            className="h-9 justify-start gap-2"
+            disabled={model.isBusy}
+            onClick={() => void actions.onConnectLocalWorld()}
+            type="button"
+            variant="outline"
+          >
+            <FolderOpen className="h-4 w-4" />
+            Connect local world
+          </Button>
+          <Button
+            className="h-9 justify-start gap-2"
+            disabled={model.isBusy}
+            onClick={actions.onToggleHostedConnection}
+            type="button"
+            variant="outline"
+          >
+            <Cloud className="h-4 w-4" />
+            Connect hosted world
+          </Button>
+        </div>
+        {model.isHostedConnectionOpen ? (
+          <div className="grid gap-2 rounded-xl border border-border/70 bg-muted/20 p-3 sm:grid-cols-[1fr_auto] sm:items-end">
+            <label
+              className="grid gap-1 text-2xs font-medium text-muted-foreground"
+              htmlFor={hostedCredentialInputId}
+            >
+              Hosted edit-share link
+              <Input
+                autoComplete="off"
+                id={hostedCredentialInputId}
+                onChange={(event) =>
+                  actions.onHostedCredentialChange(event.target.value)
+                }
+                placeholder="https://manifest.shivai.space/world/edit/..."
+                type="password"
+                value={model.hostedCredential}
+              />
+            </label>
+            <Button
+              disabled={
+                model.isHostedConnecting || !model.hostedCredential.trim()
+              }
+              onClick={() => void actions.onConnectHostedWorld()}
+              size="sm"
+              type="button"
+            >
+              {model.isHostedConnecting ? "Connecting..." : "Connect"}
+            </Button>
+            <p className="text-3xs leading-relaxed text-muted-foreground sm:col-span-2">
+              The capability stays in this client. Buzz publishes only the
+              stable world reference.
+            </p>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="grid gap-2 rounded-xl border border-border/70 bg-muted/15 p-3">
+        <label
+          className="text-2xs font-semibold uppercase tracking-wide text-muted-foreground"
+          htmlFor={publicReferenceInputId}
+        >
+          Or use a public read-only link
+        </label>
+        <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+          <textarea
+            className="min-h-9 resize-y rounded-md border border-input bg-background px-3 py-2 text-xs text-foreground shadow-sm outline-none placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
+            id={publicReferenceInputId}
+            onChange={(event) =>
+              actions.onPublicReferenceChange(event.target.value)
+            }
+            placeholder="https://manifest.shivai.space/world/exports/..."
+            rows={1}
+            value={model.publicReference}
+          />
+          <Button
+            disabled={!model.publicReference.trim() || model.isBusy}
+            onClick={actions.onUsePublicReference}
             size="sm"
             type="button"
             variant="outline"
           >
-            Use reference
+            <Link2 className="h-3.5 w-3.5" />
+            Use link
           </Button>
         </div>
-        {state.descriptorError ? (
-          <p className="text-xs text-destructive">{state.descriptorError}</p>
+        <p className="text-3xs leading-relaxed text-muted-foreground">
+          You can also paste a copied Shivai view reference. Edit-share links
+          and local paths are rejected.
+        </p>
+        {model.publicReferenceError ? (
+          <p className="text-xs text-destructive">
+            {model.publicReferenceError}
+          </p>
         ) : null}
-      </div>
-      <label className="grid gap-1 text-2xs font-medium text-muted-foreground">
-        Source
-        <select
-          className="h-9 rounded-md border border-input bg-background px-2 text-sm text-foreground"
-          onChange={(event) =>
-            patch({
-              sourceKind: event.target
-                .value as WorldViewBinding["reference"]["kind"],
-              sourceValue: "",
-              localSourceRoot: "",
-            })
-          }
-          value={state.sourceKind}
-        >
-          <option value="local-world-mirror-latest">
-            Published local world
-          </option>
-          <option value="hosted-world-view-export">Hosted view export</option>
-        </select>
-      </label>
-      <label
-        className="grid gap-1 text-2xs font-medium text-muted-foreground"
-        htmlFor={originInputId}
-      >
-        Hosted origin
-        <Input
-          autoComplete="url"
-          id={originInputId}
-          onChange={(event) => patch({ origin: event.target.value })}
-          placeholder="https://manifest.shivai.space"
-          required
-          type="url"
-          value={state.origin}
-        />
-      </label>
-      <label
-        className="grid gap-1 text-2xs font-medium text-muted-foreground"
-        htmlFor={sourceValueInputId}
-      >
-        {state.sourceKind === "local-world-mirror-latest"
-          ? "Mirror ID"
-          : "Share token"}
-        <Input
-          autoComplete="off"
-          id={sourceValueInputId}
-          onChange={(event) => patch({ sourceValue: event.target.value })}
-          placeholder={
-            state.sourceKind === "local-world-mirror-latest"
-              ? "Published mirror ID"
-              : "Hosted export token"
-          }
-          required
-          value={state.sourceValue}
-        />
-        {state.sourceKind === "hosted-world-view-export" ? (
-          <span className="font-normal leading-relaxed text-amber-11">
-            A read-only export token is an intentional bearer capability.
-            Binding publishes it in this channel or thread scope.
-          </span>
-        ) : null}
-      </label>
-      {state.sourceKind === "local-world-mirror-latest" ? (
+      </section>
+    </>
+  );
+}
+
+type WorldViewSettingsModel = {
+  catalog: WorldViewCatalog | undefined;
+  displayMode: WorldViewBinding["displayMode"];
+  isCatalogFetching: boolean;
+  label: string;
+  referenceSelected: boolean;
+  selectedView: WorldViewCatalogEntry | undefined;
+  selectedViewQualifiedName: string;
+};
+
+type WorldViewSettingsActions = {
+  onDisplayModeChange: (value: WorldViewBinding["displayMode"]) => void;
+  onLabelChange: (value: string) => void;
+  onViewChange: (value: string) => void;
+};
+
+type WorldViewSettingsProps = {
+  actions: WorldViewSettingsActions;
+  model: WorldViewSettingsModel;
+};
+
+function WorldViewSettings({ actions, model }: WorldViewSettingsProps) {
+  const labelInputId = React.useId();
+  const viewInputId = React.useId();
+
+  return (
+    <>
+      <section className="grid gap-3 border-t border-border/60 pt-4 sm:grid-cols-2">
         <label
           className="grid gap-1 text-2xs font-medium text-muted-foreground"
-          htmlFor={localSourceRootInputId}
+          htmlFor={viewInputId}
         >
-          Local source root
-          <Input
-            autoComplete="off"
-            id={localSourceRootInputId}
-            onChange={(event) => patch({ localSourceRoot: event.target.value })}
-            placeholder={
-              localSourceRootRequired
-                ? "/path/to/project.world"
-                : "Source unchanged; private path not required"
-            }
-            required={localSourceRootRequired}
-            value={state.localSourceRoot}
-          />
-          <span className="font-normal text-muted-foreground/80">
-            Kept on this device. Only the published mirror ID enters the binding
-            event.
-          </span>
+          View
+          <select
+            aria-label="View"
+            className="h-9 rounded-md border border-input bg-background px-2 text-sm text-foreground shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={!model.referenceSelected || model.isCatalogFetching}
+            id={viewInputId}
+            onChange={(event) => actions.onViewChange(event.target.value)}
+            required
+            value={model.selectedViewQualifiedName}
+          >
+            <option value="">
+              {model.isCatalogFetching
+                ? "Loading views..."
+                : model.referenceSelected
+                  ? "Choose a view"
+                  : "Choose a world first"}
+            </option>
+            {model.selectedViewQualifiedName &&
+            model.catalog &&
+            !model.selectedView ? (
+              <option disabled value={model.selectedViewQualifiedName}>
+                Previously selected view unavailable
+              </option>
+            ) : null}
+            {model.catalog?.views.map((view) => (
+              <option key={view.qualifiedName} value={view.qualifiedName}>
+                {view.name} — {view.realm.name}
+              </option>
+            ))}
+          </select>
+          {model.catalog?.views.length === 0 ? (
+            <span className="font-normal text-destructive">
+              This world has no authored views.
+            </span>
+          ) : model.selectedView ? (
+            <span className="truncate font-normal text-muted-foreground/80">
+              {model.catalog?.worldQualifiedName} ·{" "}
+              {model.selectedView.realm.name}
+            </span>
+          ) : null}
         </label>
-      ) : null}
-      <label
-        className="grid gap-1 text-2xs font-medium text-muted-foreground"
-        htmlFor={realmQualifiedNameInputId}
-      >
-        Realm qualified name
-        <Input
-          id={realmQualifiedNameInputId}
-          onChange={(event) =>
-            patch({ realmQualifiedName: event.target.value })
-          }
-          placeholder="world::main"
-          required
-          value={state.realmQualifiedName}
-        />
-      </label>
-      <label
-        className="grid gap-1 text-2xs font-medium text-muted-foreground"
-        htmlFor={viewQualifiedNameInputId}
-      >
-        View qualified name
-        <Input
-          id={viewQualifiedNameInputId}
-          onChange={(event) => patch({ viewQualifiedName: event.target.value })}
-          placeholder="world::main::@Board"
-          required
-          value={state.viewQualifiedName}
-        />
-      </label>
-      <label
-        className="grid gap-1 text-2xs font-medium text-muted-foreground"
-        htmlFor={labelInputId}
-      >
-        Label
-        <Input
-          id={labelInputId}
-          onChange={(event) => patch({ label: event.target.value })}
-          placeholder="Launch board"
-          value={state.label}
-        />
-      </label>
-      <label className="grid gap-1 text-2xs font-medium text-muted-foreground">
-        Initial display
-        <select
-          className="h-9 rounded-md border border-input bg-background px-2 text-sm text-foreground"
-          onChange={(event) =>
-            patch({
-              displayMode: event.target
-                .value as WorldViewBinding["displayMode"],
-            })
-          }
-          value={state.displayMode}
+
+        <label
+          className="grid gap-1 text-2xs font-medium text-muted-foreground"
+          htmlFor={labelInputId}
         >
-          <option value="graph">Graph</option>
-          <option value="tasks">Tasks</option>
-        </select>
-      </label>
-      {authorityMutation.error instanceof Error ? (
-        <p className="text-xs text-destructive">
-          {authorityMutation.error.message}
-        </p>
-      ) : publishError ? (
-        <p className="text-xs text-destructive">{publishError.message}</p>
-      ) : null}
-      <div className="flex justify-end">
-        <Button
-          disabled={isPublishing || authorityMutation.isPending}
-          size="sm"
-          type="submit"
-        >
-          {isPublishing || authorityMutation.isPending
-            ? "Binding..."
-            : binding
-              ? "Save view"
-              : "Bind world view"}
-        </Button>
-      </div>
-    </form>
+          <span className="inline-flex items-baseline gap-1">
+            Label
+            <span className="font-normal opacity-70">Optional</span>
+          </span>
+          <Input
+            id={labelInputId}
+            onChange={(event) => actions.onLabelChange(event.target.value)}
+            placeholder={model.selectedView?.name ?? "Launch board"}
+            value={model.label}
+          />
+        </label>
+      </section>
+
+      <fieldset className="grid gap-1.5">
+        <legend className="text-2xs font-medium text-muted-foreground">
+          Initial display
+        </legend>
+        <div className="grid w-full grid-cols-2 rounded-lg bg-muted p-1 sm:w-64">
+          {(["graph", "tasks"] as const).map((displayMode) => (
+            <button
+              aria-pressed={model.displayMode === displayMode}
+              className={cn(
+                "rounded-md px-3 py-1.5 text-xs font-medium capitalize text-muted-foreground transition-colors",
+                model.displayMode === displayMode &&
+                  "bg-background text-foreground shadow-sm",
+              )}
+              key={displayMode}
+              onClick={() => actions.onDisplayModeChange(displayMode)}
+              type="button"
+            >
+              {displayMode === "graph" ? "Graph" : "Tasks"}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+    </>
+  );
+}
+
+type WorldAuthorityChoiceProps = {
+  authority: WorldViewAuthority;
+  isSelected: boolean;
+  onSelect: () => void;
+};
+
+function WorldAuthorityChoice({
+  authority,
+  isSelected,
+  onSelect,
+}: WorldAuthorityChoiceProps) {
+  const isLocal = authority.kind === "local-world-mirror-latest";
+  const label = isLocal
+    ? localWorldName(authority.sourceRoot)
+    : "Hosted Shivai world";
+
+  return (
+    <button
+      aria-pressed={isSelected}
+      className={cn(
+        "flex w-full items-center gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted/50",
+        isSelected && "bg-primary/5",
+      )}
+      onClick={onSelect}
+      title={isLocal ? authority.sourceRoot : authority.hostedWorldId}
+      type="button"
+    >
+      <span
+        className={cn(
+          "grid h-8 w-8 shrink-0 place-items-center rounded-lg",
+          isLocal ? "bg-amber-9/10 text-amber-11" : "bg-blue-9/10 text-blue-11",
+        )}
+      >
+        {isLocal ? (
+          <FolderOpen className="h-4 w-4" />
+        ) : (
+          <Cloud className="h-4 w-4" />
+        )}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-foreground">
+          {label}
+        </span>
+        <span className="block text-3xs text-muted-foreground">
+          {isLocal ? "Published local world" : "Connected hosted world"}
+        </span>
+      </span>
+      {isSelected ? <Check className="h-4 w-4 text-primary" /> : null}
+    </button>
   );
 }

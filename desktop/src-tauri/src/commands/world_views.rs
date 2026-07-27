@@ -1,20 +1,52 @@
+use std::path::{Path, PathBuf};
+
 use buzz_core_pkg::{
     kind::KIND_WORLD_VIEW_BINDINGS,
     verification::verify_event,
     world_view::{
         effective_world_view_bindings, world_view_bindings_snapshot_from_verified_event,
-        WorldViewBindingScope, WorldViewBindingsDocument, WorldViewBindingsSnapshot,
+        WorldAuthorityRegistry, WorldViewBindingScope, WorldViewBindingsDocument,
+        WorldViewBindingsSnapshot, WorldViewReference,
     },
 };
 use buzz_world_view_resolver_pkg::{
-    resolve_world_view as resolve_typed_world_view, ResolvedWorldView, WorldViewResolutionRequest,
+    catalog_world_views_with_binary_and_access as catalog_typed_world_views,
+    publish_hosted_live_view_share_with_binary,
+    resolve_world_view_with_binary_and_access as resolve_typed_world_view,
+    PublishedHostedLiveViewShare, ResolvedWorldView, WorldViewCatalog, WorldViewResolutionAccess,
+    WorldViewResolutionRequest,
 };
 use tauri::State;
 
 use crate::{
     app_state::AppState,
+    commands::world_authorities::load_world_authority_registry,
     relay::{query_relay, submit_event},
 };
+
+fn bundled_shivai_world_binary(current_exe: &Path) -> PathBuf {
+    current_exe.with_file_name(format!("shivai-world{}", std::env::consts::EXE_SUFFIX))
+}
+
+fn shivai_world_binary() -> Result<PathBuf, String> {
+    if let Some(binary) = std::env::var_os("SHIVAI_WORLD_BIN") {
+        return Ok(PathBuf::from(binary));
+    }
+    if cfg!(debug_assertions) {
+        return Ok(PathBuf::from("world"));
+    }
+
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("resolve Buzz executable for bundled Shivai world: {error}"))?;
+    let binary = bundled_shivai_world_binary(&current_exe);
+    if !binary.is_file() {
+        return Err(format!(
+            "bundled Shivai world executable is missing at {}",
+            binary.display()
+        ));
+    }
+    Ok(binary)
+}
 
 fn exact_scope(thread_root_event_id: Option<String>) -> Result<WorldViewBindingScope, String> {
     thread_root_event_id.map_or(Ok(WorldViewBindingScope::Channel), |event_id| {
@@ -172,12 +204,159 @@ pub async fn set_world_view_bindings(
     }))
 }
 
+fn resolution_access(reference: &WorldViewReference) -> Result<WorldViewResolutionAccess, String> {
+    resolution_access_with_registry_loader(reference, load_world_authority_registry)
+}
+
+fn resolution_access_with_registry_loader(
+    reference: &WorldViewReference,
+    load_registry: impl FnOnce() -> Result<WorldAuthorityRegistry, String>,
+) -> Result<WorldViewResolutionAccess, String> {
+    match reference {
+        WorldViewReference::HostedWorldLatest {
+            origin,
+            hosted_world_id,
+        } => {
+            let registry = load_registry()?;
+            Ok(registry
+                .resolve_hosted(origin, hosted_world_id)
+                .map(|authority| WorldViewResolutionAccess::HostedEditShareFile {
+                    credential_file: authority.credential_file.clone().into(),
+                })
+                .unwrap_or(WorldViewResolutionAccess::None))
+        }
+        WorldViewReference::HostedWorldViewExport { .. }
+        | WorldViewReference::HostedWorldLiveViewShare { .. }
+        | WorldViewReference::LocalWorldMirrorLatest { .. } => Ok(WorldViewResolutionAccess::None),
+    }
+}
+
+/// List canonical authored view identities for one public world source.
+#[tauri::command]
+pub async fn catalog_world_views(
+    reference: WorldViewReference,
+) -> Result<WorldViewCatalog, String> {
+    let access = resolution_access(&reference)?;
+    let binary = shivai_world_binary()?;
+    catalog_typed_world_views(reference, binary, access)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Resolve one bound local or hosted world view through the shared typed resolver.
 #[tauri::command]
 pub async fn resolve_world_view(
     request: WorldViewResolutionRequest,
 ) -> Result<ResolvedWorldView, String> {
-    resolve_typed_world_view(request)
+    let access = resolution_access(&request.binding.reference)?;
+    let binary = shivai_world_binary()?;
+    resolve_typed_world_view(request, binary, access)
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Mint or reuse a stable public live-view capability for one connected hosted world.
+#[tauri::command]
+pub async fn publish_hosted_world_live_view_share(
+    reference: WorldViewReference,
+    view_qualified_name: String,
+) -> Result<PublishedHostedLiveViewShare, String> {
+    let WorldViewReference::HostedWorldLatest {
+        origin,
+        hosted_world_id,
+    } = reference
+    else {
+        return Err(
+            "live-view shares can only be published from a connected hosted world".into(),
+        );
+    };
+    let access = resolution_access(&WorldViewReference::HostedWorldLatest {
+        origin: origin.clone(),
+        hosted_world_id: hosted_world_id.clone(),
+    })?;
+    let WorldViewResolutionAccess::HostedEditShareFile { credential_file } = access else {
+        return Err(format!(
+            "no private hosted authority is registered for `{hosted_world_id}`"
+        ));
+    };
+    let binary = shivai_world_binary()?;
+    let share = publish_hosted_live_view_share_with_binary(
+        &origin,
+        credential_file,
+        &view_qualified_name,
+        binary,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if share.hosted_world_id != hosted_world_id {
+        return Err(format!(
+            "live-view share resolved hosted world `{}` instead of `{hosted_world_id}`",
+            share.hosted_world_id
+        ));
+    }
+    Ok(share)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn bundled_world_binary_is_a_sibling_of_the_desktop_executable() {
+        let current = Path::new("/opt/Buzz/Buzz");
+        assert_eq!(
+            bundled_shivai_world_binary(current),
+            current.with_file_name(format!("shivai-world{}", std::env::consts::EXE_SUFFIX))
+        );
+    }
+
+    #[test]
+    fn public_references_resolve_without_reading_a_corrupt_private_registry() {
+        let registry_reads = Cell::new(0);
+        let public_references = [
+            WorldViewReference::LocalWorldMirrorLatest {
+                origin: "https://hosted.example".into(),
+                mirror_id: "mirror-1".into(),
+            },
+            WorldViewReference::HostedWorldViewExport {
+                origin: "https://hosted.example".into(),
+                share_token: "public-share".into(),
+            },
+            WorldViewReference::HostedWorldLiveViewShare {
+                origin: "https://hosted.example".into(),
+                share_token: "public-live-share".into(),
+            },
+        ];
+
+        for reference in &public_references {
+            let access = resolution_access_with_registry_loader(reference, || {
+                registry_reads.set(registry_reads.get() + 1);
+                Err("invalid world authority registry".into())
+            })
+            .unwrap();
+
+            assert_eq!(access, WorldViewResolutionAccess::None);
+        }
+        assert_eq!(registry_reads.get(), 0);
+    }
+
+    #[test]
+    fn hosted_latest_is_the_only_reference_that_reads_the_private_registry() {
+        let registry_reads = Cell::new(0);
+        let reference = WorldViewReference::HostedWorldLatest {
+            origin: "https://hosted.example".into(),
+            hosted_world_id: "hosted-1".into(),
+        };
+
+        let error = resolution_access_with_registry_loader(&reference, || {
+            registry_reads.set(registry_reads.get() + 1);
+            Err("could not read world authority registry".into())
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "could not read world authority registry");
+        assert_eq!(registry_reads.get(), 1);
+    }
 }

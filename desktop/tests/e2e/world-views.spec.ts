@@ -4,6 +4,7 @@ import type { Page } from "@playwright/test";
 import type {
   ResolvedWorldView,
   WorldViewBinding,
+  WorldViewBindingsDocument,
 } from "../../src/shared/api/worldViewTypes";
 import { installMockBridge } from "../helpers/bridge";
 
@@ -28,7 +29,7 @@ function hostedBinding(
       shareToken: "view-token",
     },
     realmQualifiedName: "world::main",
-    viewQualifiedName: "world::main::@Board",
+    viewQualifiedName: "@main::Board",
     displayMode,
   };
 }
@@ -36,6 +37,10 @@ function hostedBinding(
 function resolvedWorldView(
   bindingId: string,
   label: string,
+  authorityKind:
+    | "default"
+    | "hosted-world-latest"
+    | "hosted-world-live-view-share" = "default",
 ): ResolvedWorldView {
   const presentationModel: ResolvedWorldView["presentation"]["dark"] = {
     graph: {
@@ -143,7 +148,7 @@ function resolvedWorldView(
     revision: "revision-world-view-1",
     selection: {
       realmQualifiedName: "world::main",
-      viewQualifiedName: "world::main::@Board",
+      viewQualifiedName: "@main::Board",
     },
   };
   const viewDumpNodes: ResolvedWorldView["viewDump"]["nodes"] = [
@@ -176,18 +181,30 @@ function resolvedWorldView(
     freshness:
       bindingId === ADDED_BINDING_ID ? "latest-at-resolution" : "pinned",
     authority:
-      bindingId === ADDED_BINDING_ID
+      authorityKind === "hosted-world-latest"
         ? {
-            kind: "local-world-mirror-latest",
+            kind: "hosted-world-latest",
             origin: "https://manifest.shivai.space",
-            mirrorId: "mirror-buzz-main",
+            hostedWorldId: "mock-hosted-world",
           }
-        : {
-            kind: "hosted-world-view-export",
-            origin: "https://manifest.shivai.space",
-          },
+        : authorityKind === "hosted-world-live-view-share"
+          ? {
+              kind: "hosted-world-live-view-share",
+              origin: "https://manifest.shivai.space",
+              hostedWorldId: "mock-hosted-world",
+            }
+          : bindingId === ADDED_BINDING_ID
+            ? {
+                kind: "local-world-mirror-latest",
+                origin: "https://manifest.shivai.space",
+                mirrorId: "mirror-buzz-main",
+              }
+            : {
+                kind: "hosted-world-view-export",
+                origin: "https://manifest.shivai.space",
+              },
     realm: { name: "main", qualifiedName: "world::main" },
-    view: { name: "Board", qualifiedName: "world::main::@Board" },
+    view: { name: "Board", qualifiedName: "@main::Board" },
     viewDump: {
       counts: {
         nodes: 4,
@@ -269,7 +286,7 @@ test.describe("Shivai world views", () => {
     });
     await installMockBridge(page, {
       worldViewBindings: {
-        version: 2,
+        version: 4,
         scope: { kind: "channel" },
         bindings: [hostedBinding(SEEDED_BINDING_ID, "Launch board")],
       },
@@ -412,7 +429,7 @@ test.describe("Shivai world views", () => {
   }) => {
     await installMockBridge(page, {
       worldViewBindings: {
-        version: 2,
+        version: 4,
         scope: { kind: "channel" },
         bindings: [hostedBinding(SEEDED_BINDING_ID, "Launch board")],
       },
@@ -466,7 +483,7 @@ test.describe("Shivai world views", () => {
       document: {
         bindings: [],
         scope: { kind: "channel" },
-        version: 2,
+        version: 4,
       },
     });
   });
@@ -476,7 +493,7 @@ test.describe("Shivai world views", () => {
   }) => {
     await installMockBridge(page, {
       worldViewBindings: {
-        version: 2,
+        version: 4,
         scope: { kind: "channel" },
         bindings: [hostedBinding(SEEDED_BINDING_ID, "Launch board")],
       },
@@ -513,7 +530,7 @@ test.describe("Shivai world views", () => {
     expect(publishCall?.payload).toMatchObject({
       expectedRevisionEventId: null,
       document: {
-        version: 2,
+        version: 4,
         scope: {
           kind: "thread",
           threadRootEventId: MESSAGE_THREAD_ROOT_ID,
@@ -533,7 +550,7 @@ test.describe("Shivai world views", () => {
   }) => {
     await installMockBridge(page, {
       worldViewBindings: {
-        version: 2,
+        version: 4,
         scope: { kind: "channel" },
         bindings: [hostedBinding(SEEDED_BINDING_ID, "Forum launch board")],
       },
@@ -563,7 +580,7 @@ test.describe("Shivai world views", () => {
     await expect(threadViews).toContainText("Forum launch board");
   });
 
-  test("ingests a hosted view reference and rejects edit-share capabilities", async ({
+  test("imports a public view link and rejects edit-share capabilities", async ({
     page,
   }) => {
     await installMockBridge(page, {
@@ -586,12 +603,17 @@ test.describe("Shivai world views", () => {
       .click();
 
     const worldViews = page.getByTestId("channel-world-views");
-    const descriptor = worldViews.getByLabel("Paste Shivai view reference");
-    await descriptor.fill(`Shivai view reference
+    const publicReference = worldViews.getByLabel(
+      "Or use a public read-only link",
+      { exact: true },
+    );
+    await publicReference.fill(`Shivai view reference
 Source: hosted edit share "edit-secret-token"
 Realm: world::main
-View qualified: world::main::@Board`);
-    await worldViews.getByRole("button", { name: "Use reference" }).click();
+View qualified: @main::Board`);
+    await worldViews
+      .getByRole("button", { name: "Use link", exact: true })
+      .click();
     await expect(worldViews).toContainText(
       "Edit-share capabilities cannot be published",
     );
@@ -604,23 +626,23 @@ View qualified: world::main::@Board`);
       ),
     ).toBe(0);
 
-    await descriptor.fill(`Shivai view reference
-Source: hosted view export "public-view-token"
-Realm: world::main
-View qualified: world::main::@Board`);
-    await worldViews.getByRole("button", { name: "Use reference" }).click();
-    await expect(worldViews.getByLabel("Share token")).toHaveValue(
-      "public-view-token",
+    await publicReference.fill(
+      "https://manifest.shivai.space/world/exports/public-view-token",
     );
-    await expect(worldViews.getByLabel("Realm qualified name")).toHaveValue(
-      "world::main",
-    );
-    await expect(worldViews.getByLabel("View qualified name")).toHaveValue(
-      "world::main::@Board",
+    await worldViews
+      .getByRole("button", { name: "Use link", exact: true })
+      .click();
+    await expect(worldViews).toContainText("Shared pinned read-only view");
+    await expect(worldViews.getByLabel("View", { exact: true })).toHaveValue(
+      "@main::Board",
     );
     await worldViews.getByLabel("Label").fill("Pasted launch board");
-    await worldViews.getByLabel("Initial display").selectOption("tasks");
-    await worldViews.getByRole("button", { name: "Bind world view" }).click();
+    await worldViews
+      .getByRole("button", { name: "Tasks", exact: true })
+      .click();
+    await worldViews
+      .getByRole("button", { name: "Share in this channel" })
+      .click();
 
     await expect(worldViews).toContainText("Pasted launch board");
     const commandLog = await page.evaluate(
@@ -628,7 +650,7 @@ View qualified: world::main::@Board`);
     );
     expect(
       commandLog.find(
-        (entry) => entry.command === "register_local_world_authority",
+        (entry) => entry.command === "connect_local_world_authority",
       ),
     ).toBeUndefined();
     expect(
@@ -644,13 +666,16 @@ View qualified: world::main::@Board`);
               kind: "hosted-world-view-export",
               shareToken: "public-view-token",
             },
+            realmQualifiedName: "world::main",
+            viewQualifiedName: "@main::Board",
+            displayMode: "tasks",
           },
         ],
       },
     });
   });
 
-  test("registers local authority before publishing a mirror binding", async ({
+  test("connects a local world before publishing its mirror binding", async ({
     page,
   }) => {
     await installMockBridge(page, {
@@ -658,6 +683,113 @@ View qualified: world::main::@Board`);
         [ADDED_BINDING_ID]: resolvedWorldView(
           ADDED_BINDING_ID,
           "Verify local mirror binding",
+        ),
+      },
+      worldAuthorities: [
+        {
+          kind: "local-world-mirror-latest",
+          origin: "https://manifest.shivai.space",
+          mirrorId: "mirror-buzz-main",
+          sourceRoot: "/workspace/buzz-integration.world",
+        },
+      ],
+    });
+    await openGeneralChannel(page);
+    await page.evaluate((bindingId) => {
+      Object.defineProperty(window.crypto, "randomUUID", {
+        configurable: true,
+        value: () => bindingId,
+      });
+    }, ADDED_BINDING_ID);
+
+    await page
+      .getByRole("button", { name: "Bind a Shivai world view" })
+      .click();
+    const connectedWorld = page.getByRole("button", {
+      name: /buzz-integration\.world/,
+    });
+    await expect(connectedWorld).toBeVisible();
+    await connectedWorld.click();
+    await expect(page.getByLabel("View", { exact: true })).toHaveValue(
+      "@main::Board",
+    );
+    await page.getByRole("button", { name: "Connect local world" }).click();
+    await expect(page.getByLabel("View", { exact: true })).toHaveValue(
+      "@main::Board",
+    );
+    await page.getByLabel("Label").fill("Local launch board");
+    await page.getByRole("button", { name: "Tasks", exact: true }).click();
+    await page.getByRole("button", { name: "Share in this channel" }).click();
+
+    const worldViews = page.getByTestId("channel-world-views");
+    await expect(worldViews).toContainText("Local launch board");
+    await expect(worldViews).toContainText("Verify local mirror binding");
+    await expect(worldViews).toContainText("Latest mirror");
+
+    const commandLog = await page.evaluate(
+      () => window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [],
+    );
+    const authorityCall = commandLog.find(
+      (entry) => entry.command === "connect_local_world_authority",
+    );
+    const publishCall = commandLog.find(
+      (entry) => entry.command === "set_world_view_bindings",
+    );
+    expect(authorityCall?.payload).toEqual({
+      sourceRoot: "/workspace/buzz-integration.world",
+    });
+    expect(publishCall?.payload).toMatchObject({
+      expectedRevisionEventId: null,
+      document: {
+        version: 4,
+        scope: { kind: "channel" },
+        bindings: [
+          {
+            id: ADDED_BINDING_ID,
+            label: "Local launch board",
+            reference: {
+              kind: "local-world-mirror-latest",
+              origin: "https://manifest.shivai.space",
+              mirrorId: "mirror-buzz-main",
+            },
+            realmQualifiedName: "world::main",
+            viewQualifiedName: "@main::Board",
+            displayMode: "tasks",
+          },
+        ],
+      },
+    });
+    const publishedDocument = (
+      publishCall?.payload as
+        | { document?: WorldViewBindingsDocument }
+        | undefined
+    )?.document;
+    expect(publishedDocument?.bindings[0]?.reference).toEqual({
+      kind: "local-world-mirror-latest",
+      origin: "https://manifest.shivai.space",
+      mirrorId: "mirror-buzz-main",
+    });
+    expect(
+      commandLog.findIndex(
+        (entry) => entry.command === "connect_local_world_authority",
+      ),
+    ).toBeLessThan(
+      commandLog.findIndex(
+        (entry) => entry.command === "set_world_view_bindings",
+      ),
+    );
+  });
+  test("connects a hosted world without publishing its edit-share token", async ({
+    page,
+  }) => {
+    const editShareUrl =
+      "https://manifest.shivai.space/world/edit/private-edit-token";
+    await installMockBridge(page, {
+      resolvedWorldViews: {
+        [ADDED_BINDING_ID]: resolvedWorldView(
+          ADDED_BINDING_ID,
+          "Edit hosted world",
+          "hosted-world-live-view-share",
         ),
       },
     });
@@ -672,66 +804,149 @@ View qualified: world::main::@Board`);
     await page
       .getByRole("button", { name: "Bind a Shivai world view" })
       .click();
-    await page
-      .getByLabel("Mirror ID", { exact: true })
-      .fill("mirror-buzz-main");
-    await page
-      .getByLabel("Local source root")
-      .fill("/workspace/buzz-integration.world");
-    await page.getByLabel("Realm qualified name").fill("world::main");
-    await page.getByLabel("View qualified name").fill("world::main::@Board");
-    await page.getByLabel("Label").fill("Local launch board");
-    await page.getByLabel("Initial display").selectOption("tasks");
-    await page.getByRole("button", { name: "Bind world view" }).click();
-
+    await page.getByRole("button", { name: "Connect hosted world" }).click();
+    await page.getByLabel("Hosted edit-share link").fill(editShareUrl);
+    await page.getByRole("button", { name: "Connect", exact: true }).click();
+    await expect(page.getByLabel("View", { exact: true })).toHaveValue(
+      "@main::Board",
+    );
+    await page.getByLabel("Label").fill("Mutable hosted board");
+    await page.getByRole("button", { name: "Share in this channel" }).click();
     const worldViews = page.getByTestId("channel-world-views");
-    await expect(worldViews).toContainText("Local launch board");
-    await expect(worldViews).toContainText("Verify local mirror binding");
-    await expect(worldViews).toContainText("Latest mirror");
+    await expect(worldViews).toContainText("Mutable hosted board");
+    await expect(
+      worldViews.locator('[data-world-view-tile-surface="true"]'),
+    ).toHaveAttribute("data-display-mode", "graph");
+    await expect(worldViews).toContainText("Latest shared view");
 
     const commandLog = await page.evaluate(
       () => window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [],
     );
     const authorityCall = commandLog.find(
-      (entry) => entry.command === "register_local_world_authority",
+      (entry) => entry.command === "register_hosted_world_authority",
     );
     const publishCall = commandLog.find(
       (entry) => entry.command === "set_world_view_bindings",
     );
     expect(authorityCall?.payload).toEqual({
+      credential: editShareUrl,
       origin: "https://manifest.shivai.space",
-      mirrorId: "mirror-buzz-main",
-      sourceRoot: "/workspace/buzz-integration.world",
     });
     expect(publishCall?.payload).toMatchObject({
       expectedRevisionEventId: null,
       document: {
-        version: 2,
+        version: 4,
         scope: { kind: "channel" },
         bindings: [
           {
             id: ADDED_BINDING_ID,
-            label: "Local launch board",
+            label: "Mutable hosted board",
             reference: {
-              kind: "local-world-mirror-latest",
+              kind: "hosted-world-live-view-share",
               origin: "https://manifest.shivai.space",
-              mirrorId: "mirror-buzz-main",
+              shareToken: "public-live-view-token",
             },
             realmQualifiedName: "world::main",
-            viewQualifiedName: "world::main::@Board",
-            displayMode: "tasks",
+            viewQualifiedName: "@main::Board",
+            displayMode: "graph",
           },
         ],
       },
     });
+    expect(JSON.stringify(publishCall?.payload)).not.toContain(
+      "private-edit-token",
+    );
+    const liveShareCall = commandLog.find(
+      (entry) => entry.command === "publish_hosted_world_live_view_share",
+    );
+    expect(liveShareCall?.payload).toEqual({
+      reference: {
+        kind: "hosted-world-latest",
+        origin: "https://manifest.shivai.space",
+        hostedWorldId: "mock-hosted-world",
+      },
+      viewQualifiedName: "@main::Board",
+    });
     expect(
       commandLog.findIndex(
-        (entry) => entry.command === "register_local_world_authority",
+        (entry) => entry.command === "publish_hosted_world_live_view_share",
       ),
     ).toBeLessThan(
       commandLog.findIndex(
         (entry) => entry.command === "set_world_view_bindings",
       ),
+    );
+    expect(
+      commandLog.findIndex(
+        (entry) => entry.command === "register_hosted_world_authority",
+      ),
+    ).toBeLessThan(
+      commandLog.findIndex(
+        (entry) => entry.command === "set_world_view_bindings",
+      ),
+    );
+  });
+
+  test("refreshes an existing hosted source after replacing its authority", async ({
+    page,
+  }) => {
+    await installMockBridge(page, {
+      worldAuthorities: [
+        {
+          kind: "hosted-world-latest",
+          origin: "https://manifest.shivai.space",
+          hostedWorldId: "mock-hosted-world",
+        },
+      ],
+      worldViewCatalog: {
+        formatVersion: 1,
+        revision: "catalog-before-registration",
+        worldQualifiedName: "world",
+        views: [
+          {
+            name: "@Old",
+            qualifiedName: "@main::Old",
+            realm: {
+              name: "main",
+              qualifiedName: "world::main",
+            },
+          },
+        ],
+      },
+      worldViewCatalogAfterHostedRegistration: {
+        formatVersion: 1,
+        revision: "catalog-after-registration",
+        worldQualifiedName: "world",
+        views: [
+          {
+            name: "@Fresh",
+            qualifiedName: "@main::Fresh",
+            realm: {
+              name: "main",
+              qualifiedName: "world::main",
+            },
+          },
+        ],
+      },
+    });
+    await openGeneralChannel(page);
+
+    await page
+      .getByRole("button", { name: "Bind a Shivai world view" })
+      .click();
+    await page.getByRole("button", { name: /Hosted Shivai world/ }).click();
+    await expect(page.getByLabel("View", { exact: true })).toHaveValue(
+      "@main::Old",
+    );
+
+    await page.getByRole("button", { name: "Connect hosted world" }).click();
+    await page
+      .getByLabel("Hosted edit-share link")
+      .fill("https://manifest.shivai.space/world/edit/replacement-token");
+    await page.getByRole("button", { name: "Connect", exact: true }).click();
+
+    await expect(page.getByLabel("View", { exact: true })).toHaveValue(
+      "@main::Fresh",
     );
   });
 });
