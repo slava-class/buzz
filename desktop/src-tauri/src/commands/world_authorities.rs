@@ -9,6 +9,7 @@ use std::{
 use buzz_core_pkg::world_view::{
     HostedWorldAuthority, LocalWorldAuthority, WorldAuthorityRegistry, WorldViewReference,
     WORLD_AUTHORITY_REGISTRY_FILE_NAME, WORLD_AUTHORITY_REGISTRY_VERSION,
+    WORLD_AUTHORITY_SECRET_DIRECTORY,
 };
 use buzz_world_view_resolver_pkg::HostedEditShareInspection;
 use serde::Deserialize;
@@ -17,7 +18,6 @@ use crate::managed_agents::nest_dir;
 
 const SHIVAI_LOCAL_MIRROR_BINDING_PATH: &str = ".shivai/local-world-mirror-binding.json";
 const SHIVAI_LOCAL_MIRROR_BINDING_VERSION: u8 = 2;
-const WORLD_AUTHORITY_SECRET_DIRECTORY: &str = "world-authority-secrets";
 static REGISTRY_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Deserialize)]

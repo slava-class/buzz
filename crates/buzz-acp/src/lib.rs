@@ -1759,7 +1759,7 @@ async fn tokio_main() -> Result<()> {
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
-                let env = config.persona_env_vars.clone();
+                let env = agent_spawn_environment(&config);
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
@@ -3485,7 +3485,7 @@ fn recover_panicked_agent(
     slot.respawn_in_flight = true;
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = agent_spawn_environment(config);
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -3663,7 +3663,7 @@ fn spawn_respawn_task(
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = agent_spawn_environment(config);
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -3714,6 +3714,24 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
     }
 }
 
+fn agent_spawn_environment(config: &Config) -> Vec<(String, String)> {
+    let mut environment = config.persona_env_vars.clone();
+    if matches!(
+        config::normalize_agent_command_identity(&config.agent_command).as_str(),
+        "codex" | "codex-acp"
+    ) {
+        let denied_paths = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cwd.to_str().map(pool::world_agent_denied_read_paths))
+            .unwrap_or_default();
+        environment.push((
+            acp::CODEX_DENIED_READ_PATHS_ENV.to_string(),
+            serde_json::json!(denied_paths).to_string(),
+        ));
+    }
+    environment
+}
+
 struct PoolStartup {
     agents: u32,
     command: String,
@@ -3730,7 +3748,7 @@ impl PoolStartup {
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
-            extra_env: config.persona_env_vars.clone(),
+            extra_env: agent_spawn_environment(config),
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,

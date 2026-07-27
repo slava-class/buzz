@@ -16,6 +16,8 @@ pub const CHANNEL_WORLD_VIEW_BINDINGS_D_TAG: &str = "world-view-bindings:channel
 pub const WORLD_AUTHORITY_REGISTRY_VERSION: u8 = 2;
 /// Registry file shared by the desktop host and locally running ACP agents.
 pub const WORLD_AUTHORITY_REGISTRY_FILE_NAME: &str = "world-authorities.json";
+/// Private credential directory stored beside the authority registry.
+pub const WORLD_AUTHORITY_SECRET_DIRECTORY: &str = "world-authority-secrets";
 
 /// Private machine-local mappings from public world identities to mutation authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

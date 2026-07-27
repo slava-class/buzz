@@ -2421,6 +2421,54 @@ fn load_world_authority_registry(cwd: &str) -> buzz_core::world_view::WorldAutho
     registry
 }
 
+/// Filesystem paths that Codex-backed Buzz agents must not read directly.
+///
+/// Agents receive scoped world state through the resolver and mutation
+/// authority through the harness. Keeping the registry, credential directory,
+/// and registered local source roots outside their filesystem view prevents a
+/// prompt from bypassing those typed boundaries.
+pub(crate) fn world_agent_denied_read_paths(cwd: &str) -> Vec<String> {
+    use buzz_core::world_view::{
+        WORLD_AUTHORITY_REGISTRY_FILE_NAME, WORLD_AUTHORITY_SECRET_DIRECTORY,
+    };
+    use std::path::Path;
+
+    let root = Path::new(cwd);
+    if !root.is_absolute() {
+        tracing::warn!(
+            target: "channel_context::world_authority",
+            %cwd,
+            "cannot isolate world authority paths from a non-absolute agent working directory",
+        );
+        return Vec::new();
+    }
+
+    let registry = load_world_authority_registry(cwd);
+    let mut denied_paths = vec![
+        root.join(WORLD_AUTHORITY_REGISTRY_FILE_NAME)
+            .to_string_lossy()
+            .into_owned(),
+        root.join(WORLD_AUTHORITY_SECRET_DIRECTORY)
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    denied_paths.extend(
+        registry
+            .local_authorities
+            .iter()
+            .map(|authority| authority.source_root.clone()),
+    );
+    denied_paths.extend(
+        registry
+            .hosted_authorities
+            .iter()
+            .map(|authority| authority.credential_file.clone()),
+    );
+    denied_paths.sort_unstable();
+    denied_paths.dedup();
+    denied_paths
+}
+
 fn world_view_thread_root(batch: &FlushBatch) -> Option<String> {
     let event = &batch.events.last()?.event;
     let thread_tags = crate::queue::parse_thread_tags(event);
@@ -6350,5 +6398,55 @@ mod tests {
         assert!(!section.contains("--edit-share-file"));
         assert!(!section.contains("world hosted script"));
         assert!(!section.contains("edit-token"));
+    }
+    #[test]
+    fn world_agent_denied_read_paths_cover_registry_secrets_and_world_authorities() {
+        use buzz_core::world_view::{
+            HostedWorldAuthority, LocalWorldAuthority, WorldAuthorityRegistry,
+            WORLD_AUTHORITY_REGISTRY_FILE_NAME, WORLD_AUTHORITY_REGISTRY_VERSION,
+            WORLD_AUTHORITY_SECRET_DIRECTORY,
+        };
+
+        let root = std::env::temp_dir().join(format!("buzz-acp-denied-paths-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let local_source = root.join("private.world");
+        let hosted_credential = root.join("external.edit-share");
+        let registry = WorldAuthorityRegistry {
+            version: WORLD_AUTHORITY_REGISTRY_VERSION,
+            local_authorities: vec![LocalWorldAuthority {
+                origin: "https://manifest.shivai.space".into(),
+                mirror_id: "mirror-1".into(),
+                source_root: local_source.to_string_lossy().into_owned(),
+            }],
+            hosted_authorities: vec![HostedWorldAuthority {
+                origin: "https://manifest.shivai.space".into(),
+                hosted_world_id: "hosted-1".into(),
+                credential_file: hosted_credential.to_string_lossy().into_owned(),
+            }],
+        };
+        std::fs::write(
+            root.join(WORLD_AUTHORITY_REGISTRY_FILE_NAME),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+
+        let mut expected = vec![
+            root.join(WORLD_AUTHORITY_REGISTRY_FILE_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            root.join(WORLD_AUTHORITY_SECRET_DIRECTORY)
+                .to_string_lossy()
+                .into_owned(),
+            local_source.to_string_lossy().into_owned(),
+            hosted_credential.to_string_lossy().into_owned(),
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(
+            world_agent_denied_read_paths(root.to_str().unwrap()),
+            expected
+        );
+        assert!(world_agent_denied_read_paths("relative/nest").is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

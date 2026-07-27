@@ -322,18 +322,26 @@ pub struct PublishedHostedLiveViewShare {
 #[serde(rename_all = "camelCase")]
 struct WorldHostedPublishLiveViewShareResult {
     command: String,
-    live_view_share: WorldHostedLiveViewShare,
-    source: WorldHostedLiveViewShareSource,
-    selection: WorldHostedLiveViewShareSelection,
+    live_view_share: WorldHostedPublishLiveViewShareResponse,
     revision: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WorldHostedPublishLiveViewShareResponse {
+    live_view_share: WorldHostedLiveViewShare,
+    source: WorldHostedLiveViewShareSource,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WorldHostedLiveViewShare {
+    hosted_world_id: String,
+    realm_qualified_name: String,
     share_token: String,
     share_url_path: String,
     title: String,
+    view_qualified_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,13 +350,6 @@ struct WorldHostedLiveViewShareSource {
     hosted_world_id: String,
     revision_id: String,
     package_revision: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WorldHostedLiveViewShareSelection {
-    realm_qualified_name: String,
-    view_qualified_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -643,71 +644,75 @@ pub async fn publish_hosted_live_view_share_with_binary(
     let result = envelope.result.ok_or_else(|| {
         WorldViewResolutionError::InvalidResult("the success envelope omitted `result`".into())
     })?;
-    if result.command != "view.share-live" {
+    if result.command != "hosted view share-live" {
         return invalid_result(format!(
             "unexpected live-share command `{}`",
             result.command
         ));
     }
+    let published = result.live_view_share;
+    let live_view_share = published.live_view_share;
+    let source = published.source;
     for (field, value) in [
         ("revision", result.revision.as_str()),
+        ("source.hostedWorldId", source.hosted_world_id.as_str()),
+        ("source.revisionId", source.revision_id.as_str()),
+        ("source.packageRevision", source.package_revision.as_str()),
         (
-            "source.hostedWorldId",
-            result.source.hosted_world_id.as_str(),
-        ),
-        ("source.revisionId", result.source.revision_id.as_str()),
-        (
-            "source.packageRevision",
-            result.source.package_revision.as_str(),
+            "liveViewShare.hostedWorldId",
+            live_view_share.hosted_world_id.as_str(),
         ),
         (
-            "selection.realmQualifiedName",
-            result.selection.realm_qualified_name.as_str(),
+            "liveViewShare.realmQualifiedName",
+            live_view_share.realm_qualified_name.as_str(),
         ),
         (
-            "selection.viewQualifiedName",
-            result.selection.view_qualified_name.as_str(),
+            "liveViewShare.viewQualifiedName",
+            live_view_share.view_qualified_name.as_str(),
         ),
         (
             "liveViewShare.shareToken",
-            result.live_view_share.share_token.as_str(),
+            live_view_share.share_token.as_str(),
         ),
         (
             "liveViewShare.shareUrlPath",
-            result.live_view_share.share_url_path.as_str(),
+            live_view_share.share_url_path.as_str(),
         ),
-        ("liveViewShare.title", result.live_view_share.title.as_str()),
+        ("liveViewShare.title", live_view_share.title.as_str()),
     ] {
         if value.trim().is_empty() {
             return invalid_result(format!("live-share `{field}` is blank"));
         }
     }
-    if result.revision != result.source.package_revision {
+    if result.revision != source.package_revision {
         return invalid_result(
             "live-share result revision did not match its source package revision",
         );
     }
-    if result.source.revision_id == result.source.package_revision {
+    if source.revision_id == source.package_revision {
         return invalid_result(
             "live-share source revision id unexpectedly matched its package revision",
         );
     }
-    if result.selection.view_qualified_name != view_qualified_name {
+    if live_view_share.hosted_world_id != source.hosted_world_id {
+        return invalid_result("live-share hosted world did not match its source hosted world");
+    }
+    if live_view_share.view_qualified_name != view_qualified_name {
         return invalid_result(format!(
             "live-share view `{}` did not match requested `{view_qualified_name}`",
-            result.selection.view_qualified_name
+            live_view_share.view_qualified_name
         ));
     }
 
     Ok(PublishedHostedLiveViewShare {
-        hosted_world_id: result.source.hosted_world_id,
-        source_revision: result.source.revision_id,
-        package_revision: result.source.package_revision,
-        realm_qualified_name: result.selection.realm_qualified_name,
-        view_qualified_name: result.selection.view_qualified_name,
-        share_token: result.live_view_share.share_token,
-        share_url_path: result.live_view_share.share_url_path,
-        title: result.live_view_share.title,
+        hosted_world_id: source.hosted_world_id,
+        source_revision: source.revision_id,
+        package_revision: source.package_revision,
+        realm_qualified_name: live_view_share.realm_qualified_name,
+        view_qualified_name: live_view_share.view_qualified_name,
+        share_token: live_view_share.share_token,
+        share_url_path: live_view_share.share_url_path,
+        title: live_view_share.title,
     })
 }
 
@@ -1431,6 +1436,87 @@ mod tests {
         .expect("resolve through stdin-aware child");
 
         assert_eq!(resolved.source_revision, "source-revision-1");
+        std::fs::remove_dir_all(temp_root).expect("remove temp resolver root");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decodes_canonical_nested_hosted_live_share_payload() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_root =
+            std::env::temp_dir().join(format!("buzz-hosted-live-share-{}", Uuid::new_v4()));
+        std::fs::create_dir(&temp_root).expect("create temp resolver root");
+        let output_path = temp_root.join("world-output.json");
+        let output = serde_json::to_vec(&json!({
+            "ok": true,
+            "result": {
+                "baseUrl": "https://manifest.shivai.space",
+                "command": "hosted view share-live",
+                "liveViewShare": {
+                    "liveViewShare": {
+                        "id": "live-share-1",
+                        "hostedWorldId": "hosted-1",
+                        "shareToken": "public-live-share-token",
+                        "shareUrlPath": "/world/live/public-live-share-token",
+                        "title": "Focused scope",
+                        "viewQualifiedName": "world::main::@Focused scope",
+                        "viewLocalName": "Focused scope",
+                        "realmQualifiedName": "world::main",
+                        "referencedFlowspaceQualifiedNames": [],
+                        "referencedSpaceQualifiedNames": [],
+                        "createdAt": "2026-07-28T00:00:00.000Z"
+                    },
+                    "source": {
+                        "hostedWorldId": "hosted-1",
+                        "revisionId": "revision-id-1",
+                        "packageRevision": "package-revision-1",
+                        "manifestWorldQualifiedName": "world"
+                    }
+                },
+                "revision": "package-revision-1",
+                "target": { "kind": "edit-share" }
+            },
+            "diagnostics": []
+        }))
+        .expect("encode canonical live-share output");
+        std::fs::write(&output_path, output).expect("write fake world output");
+        let credential_file = temp_root.join("authority.edit-share");
+        std::fs::write(&credential_file, "private-edit-share")
+            .expect("write private edit-share fixture");
+        let binary_path = temp_root.join("world");
+        std::fs::write(
+            &binary_path,
+            format!("#!/bin/sh\ncat '{}'\n", output_path.display()),
+        )
+        .expect("write fake world binary");
+        let mut permissions = std::fs::metadata(&binary_path)
+            .expect("read fake world metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&binary_path, permissions).expect("make fake world executable");
+
+        let published = publish_hosted_live_view_share_with_binary(
+            "https://manifest.shivai.space",
+            &credential_file,
+            "world::main::@Focused scope",
+            &binary_path,
+        )
+        .await
+        .expect("decode canonical hosted live-share payload");
+
+        assert_eq!(
+            published,
+            PublishedHostedLiveViewShare {
+                hosted_world_id: "hosted-1".into(),
+                source_revision: "revision-id-1".into(),
+                package_revision: "package-revision-1".into(),
+                realm_qualified_name: "world::main".into(),
+                view_qualified_name: "world::main::@Focused scope".into(),
+                share_token: "public-live-share-token".into(),
+                share_url_path: "/world/live/public-live-share-token".into(),
+                title: "Focused scope".into(),
+            }
+        );
         std::fs::remove_dir_all(temp_root).expect("remove temp resolver root");
     }
 }
