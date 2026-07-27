@@ -2763,9 +2763,7 @@ fn render_world_view_bindings_section(
     )],
 ) -> String {
     use buzz_core::world_view::{WorldViewBindingScope, WorldViewDisplayMode, WorldViewReference};
-    use buzz_world_view_resolver::{
-        WorldViewResolutionAuthority, WorldViewResolutionFreshness,
-    };
+    use buzz_world_view_resolver::{WorldViewResolutionAuthority, WorldViewResolutionFreshness};
 
     let mut lines = vec![
         "[Shivai World Views]".to_string(),
@@ -2833,9 +2831,7 @@ fn render_world_view_bindings_section(
         let source = match &binding.reference {
             WorldViewReference::LocalWorldMirrorLatest { .. } => "local-world-mirror-latest",
             WorldViewReference::HostedWorldViewExport { .. } => "hosted-world-view-export",
-            WorldViewReference::HostedWorldLiveViewShare { .. } => {
-                "hosted-world-live-view-share"
-            }
+            WorldViewReference::HostedWorldLiveViewShare { .. } => "hosted-world-live-view-share",
             WorldViewReference::HostedWorldLatest { .. } => "hosted-world-latest",
         };
         let display = match binding.display_mode {
@@ -2916,17 +2912,13 @@ fn render_world_view_bindings_section(
         }
 
         match (&binding.reference, local_authority, hosted_authority) {
-            (WorldViewReference::LocalWorldMirrorLatest { .. }, Some(authority), _) => {
-                let source_root = serde_json::to_string(&authority.source_root)
-                    .unwrap_or_else(|_| "\"<invalid local source root>\"".into());
-                lines.push("  Authority: mutable local source".into());
-                lines.push(format!("  Local source root: {source_root}"));
+            (WorldViewReference::LocalWorldMirrorLatest { .. }, Some(_), _) => {
                 lines.push(
-                    "  Edit: use native world commands with --root set to this local source; the hosted mirror is read-only."
+                    "  Authority: host-held mutable local source; agent context is read-only."
                         .into(),
                 );
                 lines.push(
-                    "  Publish after edits: world hosted sync-local --json --root <local-source-root>"
+                    "  Mutation: requires an explicit host-approved World operation for this binding."
                         .into(),
                 );
             }
@@ -2938,28 +2930,17 @@ fn render_world_view_bindings_section(
                 lines.push("  Authority: read-only hosted view export".into());
             }
             (
-                WorldViewReference::HostedWorldLatest { origin, .. }
-                | WorldViewReference::HostedWorldLiveViewShare { origin, .. },
+                WorldViewReference::HostedWorldLatest { .. }
+                | WorldViewReference::HostedWorldLiveViewShare { .. },
                 _,
-                Some(authority),
+                Some(_),
             ) => {
-                let origin = serde_json::to_string(origin)
-                    .unwrap_or_else(|_| "\"<invalid hosted origin>\"".into());
-                let credential_file = serde_json::to_string(&authority.credential_file)
-                    .unwrap_or_else(|_| "\"<invalid credential file>\"".into());
-                let revision = resolution
-                    .and_then(|resolution| resolution.as_ref().ok())
-                    .map(|resolved| resolved.source_revision.as_str())
-                    .unwrap_or("<revision-from-latest>");
-                lines.push("  Authority: mutable hosted world".into());
-                lines.push(format!(
-                    "  Read: world hosted latest --json --base-url {origin} --edit-share-file {credential_file} --anonymous-session"
-                ));
-                lines.push(format!(
-                    "  Edit: world hosted script --json --base-url {origin} --edit-share-file {credential_file} --anonymous-session --expected-revision {revision} --stdin"
-                ));
                 lines.push(
-                    "  Concurrency: after a revision conflict, re-read latest and reassess before issuing a new revision-checked mutation."
+                    "  Authority: host-held mutable hosted world; agent context is read-only."
+                        .into(),
+                );
+                lines.push(
+                    "  Mutation: requires an explicit host-approved World operation for this binding."
                         .into(),
                 );
             }
@@ -2969,7 +2950,7 @@ fn render_world_view_bindings_section(
                 _,
                 None,
             ) => lines.push(
-                "  Authority: read-only on this client; register the hosted edit-share URL here to enable mutation."
+                "  Authority: read-only on this client; register the hosted edit-share URL here to enable host-approved operations."
                     .into(),
             ),
         }
@@ -6219,7 +6200,7 @@ mod tests {
     }
 
     #[test]
-    fn world_view_prompt_exposes_registered_local_mutation_authority() {
+    fn world_view_prompt_keeps_registered_local_mutation_authority_host_owned() {
         use buzz_core::world_view::{
             LocalWorldAuthority, WorldAuthorityRegistry, WorldViewBinding, WorldViewBindingScope,
             WorldViewBindingsDocument, WorldViewDisplayMode, WorldViewReference,
@@ -6296,13 +6277,17 @@ mod tests {
         assert!(section.contains(&format!("--binding {binding_id}")));
         assert!(section.contains("Effective scope: channel"));
         assert!(section.contains("Declaration: scope=channel binding-revision="));
-        assert!(section.contains("Authority: mutable local source"));
-        assert!(section.contains(r#"Local source root: "/worlds/delivery.world""#));
-        assert!(section.contains("world hosted sync-local"));
+        assert!(section
+            .contains("Authority: host-held mutable local source; agent context is read-only."));
+        assert!(section.contains(
+            "Mutation: requires an explicit host-approved World operation for this binding."
+        ));
+        assert!(!section.contains("/worlds/delivery.world"));
+        assert!(!section.contains("world hosted sync-local"));
     }
 
     #[test]
-    fn world_view_prompt_exposes_private_hosted_mutation_authority() {
+    fn world_view_prompt_keeps_private_hosted_mutation_authority_host_owned() {
         use buzz_core::world_view::{
             EffectiveWorldViewBinding, EffectiveWorldViewBindings, HostedWorldAuthority,
             WorldAuthorityRegistry, WorldViewBinding, WorldViewBindingScope, WorldViewDisplayMode,
@@ -6356,12 +6341,14 @@ mod tests {
         let section =
             render_world_view_bindings_section(&state, &registry, &[(binding_id, Ok(resolved))]);
 
-        assert!(section.contains("Authority: mutable hosted world"));
+        assert!(section
+            .contains("Authority: host-held mutable hosted world; agent context is read-only."));
         assert!(section.contains(
-            r#"world hosted latest --json --base-url "https://manifest.shivai.space" --edit-share-file "/credentials/hosted-1.edit-share" --anonymous-session"#
+            "Mutation: requires an explicit host-approved World operation for this binding."
         ));
-        assert!(section.contains("--expected-revision source-revision-1 --stdin"));
-        assert!(section.contains("after a revision conflict, re-read latest"));
+        assert!(!section.contains("/credentials/hosted-1.edit-share"));
+        assert!(!section.contains("--edit-share-file"));
+        assert!(!section.contains("world hosted script"));
         assert!(!section.contains("edit-token"));
     }
 }

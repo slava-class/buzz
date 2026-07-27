@@ -3,8 +3,8 @@ use buzz_core::verification::verify_event;
 use buzz_core::world_view::{
     effective_world_view_bindings, world_view_bindings_snapshot_from_verified_event,
     EffectiveWorldViewBinding, WorldAuthorityRegistry, WorldViewBinding, WorldViewBindingScope,
-    WorldViewBindingsDocument, WorldViewBindingsSnapshot, WorldViewDisplayMode,
-    WorldViewReference, WORLD_AUTHORITY_REGISTRY_FILE_NAME, WORLD_VIEW_BINDINGS_VERSION,
+    WorldViewBindingsDocument, WorldViewBindingsSnapshot, WorldViewDisplayMode, WorldViewReference,
+    WORLD_AUTHORITY_REGISTRY_FILE_NAME, WORLD_VIEW_BINDINGS_VERSION,
 };
 use buzz_world_view_resolver::{
     catalog_world_views_with_access, publish_hosted_live_view_share,
@@ -489,8 +489,7 @@ async fn cmd_bind(
     let event = client.sign_event(builder)?;
     let revision_event_id = event.id.to_hex();
     let relay_response = client.submit_event(event).await?;
-    let mut next_resolve_command =
-        format!("buzz world-views resolve --channel {channel_id}");
+    let mut next_resolve_command = format!("buzz world-views resolve --channel {channel_id}");
     if let Some(thread_root_event_id) = scope.thread_root_event_id() {
         next_resolve_command.push_str(" --thread-root ");
         next_resolve_command.push_str(thread_root_event_id);

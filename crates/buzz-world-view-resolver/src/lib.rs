@@ -400,7 +400,8 @@ pub async fn resolve_world_view_with_binary_and_access(
     request.validate()?;
     let binary = binary.as_ref();
     let invocation = world_cli_invocation(&request.binding, &access)?;
-    let stdout = run_world_cli_invocation(binary, invocation, &request.binding.reference).await?;
+    let stdout =
+        run_world_cli_invocation(binary, invocation, &request.binding.reference, &access).await?;
     decode_world_view_resolution(&request, &stdout, Utc::now())
 }
 
@@ -433,7 +434,7 @@ pub async fn catalog_world_views_with_binary_and_access(
         .map_err(WorldViewResolutionError::InvalidRequest)?;
     let binary = binary.as_ref();
     let invocation = world_view_cli_invocation(&reference, &access, "catalog")?;
-    let stdout = run_world_cli_invocation(binary, invocation, &reference).await?;
+    let stdout = run_world_cli_invocation(binary, invocation, &reference, &access).await?;
     decode_world_view_catalog(&stdout)
 }
 
@@ -441,6 +442,7 @@ async fn run_world_cli_invocation(
     binary: &Path,
     invocation: WorldCliInvocation<'_>,
     reference: &WorldViewReference,
+    access: &WorldViewResolutionAccess,
 ) -> Result<Vec<u8>, WorldViewResolutionError> {
     let mut command = tokio::process::Command::new(binary);
     command
@@ -481,8 +483,11 @@ async fn run_world_cli_invocation(
                 source,
             })?;
     if !output.status.success() {
-        let diagnostics =
-            redact_diagnostics(String::from_utf8_lossy(&output.stderr).trim(), reference);
+        let diagnostics = redact_diagnostics(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            reference,
+            access,
+        );
         return Err(WorldViewResolutionError::CommandFailed(
             if diagnostics.is_empty() {
                 "the command exited without diagnostics".into()
@@ -533,7 +538,10 @@ pub async fn inspect_hosted_edit_share_with_binary(
             source,
         })?;
     if !output.status.success() {
-        let diagnostics = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let diagnostics = redact_credential_file_path(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            credential_file.as_ref(),
+        );
         return Err(WorldViewResolutionError::CommandFailed(
             if diagnostics.is_empty() {
                 "the command exited without diagnostics".into()
@@ -578,13 +586,8 @@ pub async fn publish_hosted_live_view_share(
     let binary = std::env::var_os("SHIVAI_WORLD_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("world"));
-    publish_hosted_live_view_share_with_binary(
-        origin,
-        credential_file,
-        view_qualified_name,
-        binary,
-    )
-    .await
+    publish_hosted_live_view_share_with_binary(origin, credential_file, view_qualified_name, binary)
+        .await
 }
 
 /// Mint or reuse a stable public live-view share through an explicit `world` binary.
@@ -619,7 +622,10 @@ pub async fn publish_hosted_live_view_share_with_binary(
             source,
         })?;
     if !output.status.success() {
-        let diagnostics = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let diagnostics = redact_credential_file_path(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            credential_file.as_ref(),
+        );
         return Err(WorldViewResolutionError::CommandFailed(
             if diagnostics.is_empty() {
                 "the command exited without diagnostics".into()
@@ -645,7 +651,10 @@ pub async fn publish_hosted_live_view_share_with_binary(
     }
     for (field, value) in [
         ("revision", result.revision.as_str()),
-        ("source.hostedWorldId", result.source.hosted_world_id.as_str()),
+        (
+            "source.hostedWorldId",
+            result.source.hosted_world_id.as_str(),
+        ),
         ("source.revisionId", result.source.revision_id.as_str()),
         (
             "source.packageRevision",
@@ -860,10 +869,8 @@ fn invalid_result<T>(message: impl Into<String>) -> Result<T, WorldViewResolutio
 fn authority_readback(
     reference: &WorldViewReference,
     result: &WorldViewDumpResult,
-) -> Result<
-    (WorldViewResolutionAuthority, WorldViewResolutionFreshness),
-    WorldViewResolutionError,
-> {
+) -> Result<(WorldViewResolutionAuthority, WorldViewResolutionFreshness), WorldViewResolutionError>
+{
     match reference {
         WorldViewReference::HostedWorldViewExport { origin, .. } => Ok((
             WorldViewResolutionAuthority::HostedWorldViewExport {
@@ -1005,17 +1012,37 @@ fn world_view_cli_invocation<'a>(
     Ok(WorldCliInvocation { args, stdin })
 }
 
-fn redact_diagnostics(diagnostics: &str, reference: &WorldViewReference) -> String {
-    match reference {
+fn redact_diagnostics(
+    diagnostics: &str,
+    reference: &WorldViewReference,
+    access: &WorldViewResolutionAccess,
+) -> String {
+    let diagnostics = match reference {
         WorldViewReference::HostedWorldViewExport { share_token, .. } => {
             diagnostics.replace(share_token, "<redacted>")
         }
         WorldViewReference::HostedWorldLiveViewShare { share_token, .. } => {
             diagnostics.replace(share_token, "<redacted>")
         }
-        WorldViewReference::LocalWorldMirrorLatest { .. } => diagnostics.to_owned(),
-        WorldViewReference::HostedWorldLatest { .. } => diagnostics.to_owned(),
+        WorldViewReference::LocalWorldMirrorLatest { .. }
+        | WorldViewReference::HostedWorldLatest { .. } => diagnostics.to_owned(),
+    };
+    match access {
+        WorldViewResolutionAccess::HostedEditShareFile { credential_file } => {
+            redact_credential_file_path(&diagnostics, credential_file)
+        }
+        WorldViewResolutionAccess::None => diagnostics,
     }
+}
+
+fn redact_credential_file_path(diagnostics: &str, credential_file: &Path) -> String {
+    if credential_file.as_os_str().is_empty() {
+        return diagnostics.to_owned();
+    }
+    diagnostics.replace(
+        credential_file.to_string_lossy().as_ref(),
+        "<redacted-credential-file>",
+    )
 }
 
 fn next_command(request: &WorldViewResolutionRequest) -> String {
@@ -1281,8 +1308,32 @@ mod tests {
             share_token: "secret-view-token".into(),
         };
         assert_eq!(
-            redact_diagnostics("failed secret-view-token", &reference),
+            redact_diagnostics(
+                "failed secret-view-token",
+                &reference,
+                &WorldViewResolutionAccess::None,
+            ),
             "failed <redacted>"
+        );
+    }
+
+    #[test]
+    fn redacts_host_credential_paths_from_command_diagnostics() {
+        let reference = WorldViewReference::HostedWorldLatest {
+            origin: "https://manifest.shivai.space".into(),
+            hosted_world_id: "hosted-1".into(),
+        };
+        let access = WorldViewResolutionAccess::HostedEditShareFile {
+            credential_file: PathBuf::from("/private/edit-share.txt"),
+        };
+
+        assert_eq!(
+            redact_diagnostics(
+                "failed to read /private/edit-share.txt",
+                &reference,
+                &access,
+            ),
+            "failed to read <redacted-credential-file>"
         );
     }
 
@@ -1305,7 +1356,7 @@ mod tests {
     }
 
     #[test]
-    fn routes_hosted_mutation_authority_through_a_credential_file() {
+    fn routes_private_hosted_read_authority_through_a_credential_file() {
         let request = request(WorldViewReference::HostedWorldLatest {
             origin: "https://manifest.shivai.space".into(),
             hosted_world_id: "hosted-1".into(),
