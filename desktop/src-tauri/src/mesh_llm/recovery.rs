@@ -243,19 +243,46 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
     let _rearm_guard = state.mesh_recovery.rearm_lock.lock().await;
     let recovery = recover_stale_mesh_runtime(&state, MeshRecoveryUrgency::Watchdog).await;
     let active_pubkeys = active_managed_agent_pubkeys(&state);
+    // Mesh participation is resolved through the same definition-authoritative
+    // path as spawn/restore (#1968): definition → global fallback. A linked
+    // instance's own bytes never contribute.
+    let personas = crate::managed_agents::load_personas(app).unwrap_or_default();
+    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
 
     match recovery {
         MeshRuntimeRecovery::Live
         | MeshRuntimeRecovery::Debouncing
         | MeshRuntimeRecovery::Replaced => return Ok(()),
+        MeshRuntimeRecovery::RestartRequired => {
+            let records = crate::managed_agents::load_managed_agents(app).unwrap_or_default();
+            if !records.iter().any(|record| {
+                running_relay_mesh_model_id(record, &active_pubkeys, &personas, &global).is_some()
+            }) {
+                // A foreground save may still be bringing up its first ingress.
+                // Only an already-running consumer justifies an automatic app
+                // relaunch from the background watchdog.
+                return Ok(());
+            }
+            eprintln!(
+                "buzz-mesh: supervised client startup lost its ingress before the SDK exposed a shutdown handle; restarting Buzz"
+            );
+            app.request_restart();
+            return Ok(());
+        }
         MeshRuntimeRecovery::ReleasePending => {
             return Err(format!(
                 "{MESH_REARM_ERROR_SENTINEL}old local mesh ingress is still shutting down"
             ));
         }
-        MeshRuntimeRecovery::Absent
-        | MeshRuntimeRecovery::Evicted
-        | MeshRuntimeRecovery::RestartRequired => {}
+        MeshRuntimeRecovery::Absent => {
+            let records = crate::managed_agents::load_managed_agents(app).unwrap_or_default();
+            if !records.iter().any(|record| {
+                running_relay_mesh_model_id(record, &active_pubkeys, &personas, &global).is_some()
+            }) {
+                return Ok(());
+            }
+        }
+        MeshRuntimeRecovery::Evicted => {}
     }
 
     let records = crate::managed_agents::load_managed_agents(app).unwrap_or_default();
@@ -265,7 +292,7 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
         .into_iter()
         .filter_map(|record| {
             running_relay_mesh_model_id(&record, &active_pubkeys, &personas, &global)
-                .map(|model_id| (record, model_id))
+                .map(|mesh_model_id| (record, mesh_model_id))
         })
         .collect();
     if mesh_records.is_empty() {
@@ -281,10 +308,10 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
     }
 
     let mut first_error = None;
-    for (record, model_id) in &mesh_records {
+    for (record, mesh_model_id) in &mesh_records {
         match crate::commands::mesh_llm::ensure_relay_mesh_for_record(
             app,
-            Some(model_id.as_str()),
+            Some(mesh_model_id.as_str()),
             false,
         )
         .await
@@ -321,21 +348,25 @@ fn active_managed_agent_pubkeys(state: &AppState) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Effective mesh model for a record that is actively running, or `None`
+/// when the record is not a running relay-mesh consumer. Resolution goes
+/// through `resolve_effective_relay_mesh_model_id` (definition → global
+/// fallback, #1968) so the watchdog agrees with spawn/restore about which
+/// agents are mesh-backed.
 fn running_relay_mesh_model_id(
     record: &crate::managed_agents::ManagedAgentRecord,
     active_pubkeys: &HashSet<String>,
     personas: &[crate::managed_agents::AgentDefinition],
     global: &crate::managed_agents::GlobalAgentConfig,
 ) -> Option<String> {
-    if record.backend != crate::managed_agents::BackendKind::Local
-        || !active_pubkeys.contains(&record.pubkey.to_ascii_lowercase())
-        || !record
+    let running = record.backend == crate::managed_agents::BackendKind::Local
+        && active_pubkeys.contains(&record.pubkey.to_ascii_lowercase())
+        && record
             .runtime_pid
-            .is_none_or(crate::managed_agents::process_is_running)
-    {
+            .is_none_or(crate::managed_agents::process_is_running);
+    if !running {
         return None;
     }
-
     crate::managed_agents::effective_config::resolve_effective_relay_mesh_model_id(
         record, personas, global,
     )
@@ -465,7 +496,7 @@ mod tests {
 
     #[test]
     fn only_running_relay_mesh_agents_trigger_rearm() {
-        let personas = [];
+        let personas: Vec<crate::managed_agents::AgentDefinition> = Vec::new();
         let global = crate::managed_agents::GlobalAgentConfig::default();
         let empty = active_set(&[]);
         assert!(running_relay_mesh_model_id(
@@ -485,12 +516,12 @@ mod tests {
                 &global,
             )
             .as_deref(),
-            Some("Qwen3"),
+            Some("Qwen3")
         );
         assert_eq!(
-            running_relay_mesh_model_id(&mesh_record("live", None), &active, &personas, &global,)
+            running_relay_mesh_model_id(&mesh_record("live", None), &active, &personas, &global)
                 .as_deref(),
-            Some("Qwen3"),
+            Some("Qwen3")
         );
 
         let mut non_mesh = mesh_record("plain", Some(std::process::id()));
