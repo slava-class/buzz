@@ -227,54 +227,117 @@ fn deep_merge(
     }
 }
 
-/// Internal spawn metadata carrying absolute paths that Codex must not read.
+/// Internal spawn metadata carrying absolute filesystem permissions for Codex.
 ///
 /// The harness consumes this value while constructing `CODEX_CONFIG`; it is
 /// never forwarded to the agent process.
-pub(crate) const CODEX_DENIED_READ_PATHS_ENV: &str = "BUZZ_ACP_CODEX_DENIED_READ_PATHS";
+pub(crate) const CODEX_FILESYSTEM_PERMISSIONS_ENV: &str = "BUZZ_ACP_CODEX_FILESYSTEM_PERMISSIONS";
 const BUZZ_CODEX_PERMISSION_PROFILE: &str = "buzz-agent";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CodexFilesystemPathAccess {
+    Deny,
+    Write,
+}
+
+impl CodexFilesystemPathAccess {
+    const fn as_codex_value(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Write => "write",
+        }
+    }
+}
+
+fn codex_filesystem_config(
+    path_permissions: std::collections::BTreeMap<String, CodexFilesystemPathAccess>,
+    workspace_root: Option<&std::path::Path>,
+) -> serde_json::Map<String, serde_json::Value> {
+    use std::path::Path;
+
+    let mut workspace_rules = serde_json::Map::from_iter([(
+        ".".to_string(),
+        serde_json::Value::String("write".to_string()),
+    )]);
+    let mut absolute_permissions = std::collections::BTreeMap::new();
+    for (path, access) in path_permissions {
+        let relative = workspace_root
+            .and_then(|root| Path::new(&path).strip_prefix(root).ok())
+            .filter(|relative| !relative.as_os_str().is_empty());
+        if let Some(relative) = relative {
+            workspace_rules.insert(
+                relative.to_string_lossy().into_owned(),
+                serde_json::Value::String(access.as_codex_value().to_string()),
+            );
+        } else {
+            absolute_permissions.insert(path, access);
+        }
+    }
+
+    let mut filesystem = serde_json::Map::from_iter([
+        (
+            ":minimal".to_string(),
+            serde_json::Value::String("read".to_string()),
+        ),
+        (
+            ":workspace_roots".to_string(),
+            serde_json::Value::Object(workspace_rules),
+        ),
+    ]);
+    for (path, access) in absolute_permissions {
+        filesystem.insert(
+            path,
+            serde_json::Value::String(access.as_codex_value().to_string()),
+        );
+    }
+    filesystem
+}
 
 /// Build the merged `CODEX_CONFIG` value for a Codex-backed Buzz agent.
 ///
 /// Persona, generated, and parent config objects are recursively merged in
 /// that order. Buzz then installs and selects one canonical permission profile
-/// that preserves workspace writes while denying direct reads of private world
-/// authority paths. The generated network grant is represented on that same
-/// profile rather than as a second sandbox authority.
+/// that preserves workspace writes, denies private registry discovery, and
+/// applies explicitly supplied World source paths. The generated network grant
+/// is represented on that same profile rather than as a second sandbox
+/// authority.
 ///
 /// The function returns `None` only when neither a generated Codex config nor
-/// Buzz isolation metadata is present. Invalid config or missing/empty
-/// isolation metadata fails closed with [`AcpError::Protocol`].
+/// Buzz filesystem metadata is present. Invalid or empty metadata fails closed
+/// with [`AcpError::Protocol`].
 pub(crate) fn build_codex_config_env(
     extra_env: &[(String, String)],
     parent_codex_config: Option<&str>,
     has_generated_codex_config: bool,
+    workspace_root: Option<&std::path::Path>,
 ) -> Result<Option<String>, AcpError> {
-    let denied_path_entries: Vec<&str> = extra_env
+    let filesystem_permission_entries: Vec<&str> = extra_env
         .iter()
-        .filter(|(key, _)| key == CODEX_DENIED_READ_PATHS_ENV)
+        .filter(|(key, _)| key == CODEX_FILESYSTEM_PERMISSIONS_ENV)
         .map(|(_, value)| value.as_str())
         .collect();
-    let isolation_required = !denied_path_entries.is_empty();
-    if !has_generated_codex_config && !isolation_required {
+    let permissions_required = !filesystem_permission_entries.is_empty();
+    if !has_generated_codex_config && !permissions_required {
         return Ok(None);
     }
 
-    let mut denied_paths = Vec::new();
-    for raw in denied_path_entries {
-        let paths = serde_json::from_str::<Vec<String>>(raw).map_err(|error| {
+    let mut path_permissions = std::collections::BTreeMap::new();
+    for raw in filesystem_permission_entries {
+        let permissions = serde_json::from_str::<
+            std::collections::BTreeMap<String, CodexFilesystemPathAccess>,
+        >(raw)
+        .map_err(|error| {
             AcpError::Protocol(format!(
-                "{CODEX_DENIED_READ_PATHS_ENV} is not a JSON string array: {error}"
+                "{CODEX_FILESYSTEM_PERMISSIONS_ENV} is not a JSON path-access object: {error}"
             ))
         })?;
-        denied_paths.extend(paths);
+        path_permissions.extend(permissions);
     }
-    denied_paths.retain(|path| !path.trim().is_empty());
-    denied_paths.sort_unstable();
-    denied_paths.dedup();
-    if denied_paths.is_empty() {
+    path_permissions.retain(|path, _| !path.trim().is_empty());
+    if path_permissions.is_empty() {
         return Err(AcpError::Protocol(format!(
-            "{CODEX_DENIED_READ_PATHS_ENV} must contain at least one path"
+            "{CODEX_FILESYSTEM_PERMISSIONS_ENV} must contain at least one path"
         )));
     }
 
@@ -314,21 +377,13 @@ pub(crate) fn build_codex_config_env(
         deep_merge(&mut base, parent_object);
     }
 
-    let mut filesystem = serde_json::Map::from_iter([
-        (
-            ":minimal".to_string(),
-            serde_json::Value::String("read".to_string()),
-        ),
-        (
-            ":workspace_roots".to_string(),
-            serde_json::Value::String("write".to_string()),
-        ),
-    ]);
-    for path in denied_paths {
-        // `none` is accepted by both the current Codex schema and the older
-        // profile schema bundled with codex-acp 1.x.
-        filesystem.insert(path, serde_json::Value::String("none".to_string()));
-    }
+    // Permission profiles and the legacy sandbox settings do not compose.
+    // Network access and filesystem authority are represented below, so remove
+    // every older sandbox selector before selecting the Buzz profile.
+    base.remove("sandbox_mode");
+    base.remove("sandbox_workspace_write");
+
+    let filesystem = codex_filesystem_config(path_permissions, workspace_root);
     let permission_profile = serde_json::json!({
         "workspace_roots": {
             ".": true,
@@ -343,7 +398,7 @@ pub(crate) fn build_codex_config_env(
         .or_insert_with(|| serde_json::json!({}));
     let serde_json::Value::Object(permissions) = permissions else {
         return Err(AcpError::Protocol(
-            "CODEX_CONFIG permissions is not an object; cannot install Buzz isolation".into(),
+            "CODEX_CONFIG permissions is not an object; cannot install Buzz permissions".into(),
         ));
     };
     permissions.insert(
@@ -440,26 +495,28 @@ impl AcpClient {
         // For most keys, operator precedence wins: skip injection if already set
         // in the parent environment.
         //
-        // CODEX_CONFIG and the private isolation metadata are handled together.
+        // CODEX_CONFIG and the private filesystem metadata are handled together.
         // The metadata is consumed here and is never exposed to the child.
         let codex_config_build_requested = has_generated_codex_config
             || extra_env
                 .iter()
-                .any(|(key, _)| key == CODEX_DENIED_READ_PATHS_ENV);
+                .any(|(key, _)| key == CODEX_FILESYSTEM_PERMISSIONS_ENV);
         let parent_codex_config = if codex_config_build_requested {
             std::env::var("CODEX_CONFIG").ok()
         } else {
             None
         };
+        let workspace_root = std::env::current_dir().ok();
         let codex_config_value = build_codex_config_env(
             extra_env,
             parent_codex_config.as_deref(),
             has_generated_codex_config,
+            workspace_root.as_deref(),
         )?;
         let codex_merge_active = codex_config_value.is_some();
 
         for (key, value) in extra_env {
-            if key == CODEX_DENIED_READ_PATHS_ENV {
+            if key == CODEX_FILESYSTEM_PERMISSIONS_ENV {
                 continue;
             }
             if key == "CODEX_CONFIG" && codex_merge_active {
@@ -3505,11 +3562,16 @@ mod tests {
             .collect()
     }
 
-    fn isolated_env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn permissioned_env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         let mut environment = env(pairs);
         environment.push((
-            CODEX_DENIED_READ_PATHS_ENV.to_string(),
-            r#"["/private/world-authorities.json","/private/world-authority-secrets"]"#.to_string(),
+            CODEX_FILESYSTEM_PERMISSIONS_ENV.to_string(),
+            r#"{
+                "/private/world-authorities.json":"deny",
+                "/private/world-authority-secrets":"deny",
+                "/worlds/delivery.world":"write"
+            }"#
+            .to_string(),
         ));
         environment
     }
@@ -3517,26 +3579,34 @@ mod tests {
     const GENERATED: &str = r#"{"sandbox_workspace_write":{"network_access":true}}"#;
 
     #[test]
-    fn build_codex_config_env_returns_none_without_codex_or_isolation_config() {
+    fn build_codex_config_env_returns_none_without_codex_or_filesystem_config() {
         let extra = env(&[("GOOSE_PROVIDER", "openai")]);
-        assert_eq!(build_codex_config_env(&extra, None, false).unwrap(), None);
+        assert_eq!(
+            build_codex_config_env(&extra, None, false, None).unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn build_codex_config_env_requires_isolation_metadata_for_generated_config() {
+    fn build_codex_config_env_requires_filesystem_metadata_for_generated_config() {
         let extra = env(&[("CODEX_CONFIG", GENERATED)]);
-        let error = build_codex_config_env(&extra, None, true).unwrap_err();
-        assert!(error.to_string().contains(CODEX_DENIED_READ_PATHS_ENV));
+        let error = build_codex_config_env(&extra, None, true, None).unwrap_err();
+        assert!(error.to_string().contains(CODEX_FILESYSTEM_PERMISSIONS_ENV));
     }
 
     #[test]
-    fn build_codex_config_env_installs_private_path_denials_and_network_grant() {
+    fn build_codex_config_env_installs_world_source_paths_and_network_grant() {
         let persona = r#"{"persona":{"enabled":true},"shared":"persona"}"#;
-        let extra = isolated_env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
+        let extra = permissioned_env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
         let parent = r#"{"operator":"keep","shared":"parent"}"#;
-        let merged = build_codex_config_env(&extra, Some(parent), true)
-            .unwrap()
-            .unwrap();
+        let merged = build_codex_config_env(
+            &extra,
+            Some(parent),
+            true,
+            Some(std::path::Path::new("/private")),
+        )
+        .unwrap()
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
 
         assert_eq!(value["persona"]["enabled"], true);
@@ -3552,27 +3622,34 @@ mod tests {
             "read"
         );
         assert_eq!(
-            value["permissions"]["buzz-agent"]["filesystem"][":workspace_roots"],
+            value["permissions"]["buzz-agent"]["filesystem"][":workspace_roots"]["."],
             "write"
         );
         assert_eq!(
-            value["permissions"]["buzz-agent"]["filesystem"]["/private/world-authorities.json"],
-            "none"
+            value["permissions"]["buzz-agent"]["filesystem"][":workspace_roots"]
+                ["world-authorities.json"],
+            "deny"
         );
         assert_eq!(
-            value["permissions"]["buzz-agent"]["filesystem"]["/private/world-authority-secrets"],
-            "none"
+            value["permissions"]["buzz-agent"]["filesystem"][":workspace_roots"]
+                ["world-authority-secrets"],
+            "deny"
+        );
+        assert_eq!(
+            value["permissions"]["buzz-agent"]["filesystem"]["/worlds/delivery.world"],
+            "write"
         );
         assert_eq!(
             value["permissions"]["buzz-agent"]["network"]["enabled"],
             true
         );
+        assert!(value.get("sandbox_workspace_write").is_none());
     }
 
     #[test]
-    fn build_codex_config_env_isolates_codex_without_generated_network_grant() {
-        let extra = isolated_env(&[("CODEX_CONFIG", r#"{"persona":"keep"}"#)]);
-        let merged = build_codex_config_env(&extra, None, false)
+    fn build_codex_config_env_permissions_apply_without_generated_network_grant() {
+        let extra = permissioned_env(&[("CODEX_CONFIG", r#"{"persona":"keep"}"#)]);
+        let merged = build_codex_config_env(&extra, None, false, None)
             .unwrap()
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
@@ -3587,8 +3664,10 @@ mod tests {
 
     #[test]
     fn build_codex_config_env_forces_buzz_profile_over_parent_permissions() {
-        let extra = isolated_env(&[("CODEX_CONFIG", GENERATED)]);
+        let extra = permissioned_env(&[("CODEX_CONFIG", GENERATED)]);
         let parent = r#"{
+            "sandbox_mode":"danger-full-access",
+            "sandbox_workspace_write":{"writable_roots":["/unsafe"]},
             "default_permissions":"operator-profile",
             "permissions":{
                 "buzz-agent":{
@@ -3598,7 +3677,7 @@ mod tests {
                 "operator-profile":{"filesystem":{":root":"write"}}
             }
         }"#;
-        let merged = build_codex_config_env(&extra, Some(parent), true)
+        let merged = build_codex_config_env(&extra, Some(parent), true, None)
             .unwrap()
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
@@ -3610,64 +3689,69 @@ mod tests {
         );
         assert_eq!(
             value["permissions"]["buzz-agent"]["filesystem"]["/private/world-authorities.json"],
-            "none"
+            "deny"
         );
         assert_eq!(
             value["permissions"]["operator-profile"]["filesystem"][":root"],
             "write"
         );
+        assert!(value.get("sandbox_mode").is_none());
+        assert!(value.get("sandbox_workspace_write").is_none());
     }
 
     #[test]
     fn build_codex_config_env_does_not_promote_legacy_world_root_metadata() {
-        let extra = isolated_env(&[
+        let extra = permissioned_env(&[
             ("CODEX_CONFIG", GENERATED),
             (
                 "BUZZ_ACP_LOCAL_WORLD_WRITABLE_ROOTS",
-                r#"["/worlds/delivery.world"]"#,
+                r#"["/worlds/legacy.world"]"#,
             ),
         ]);
-        let merged = build_codex_config_env(&extra, None, true).unwrap().unwrap();
+        let merged = build_codex_config_env(&extra, None, true, None)
+            .unwrap()
+            .unwrap();
 
-        assert!(!merged.contains("/worlds/delivery.world"));
+        assert!(!merged.contains("/worlds/legacy.world"));
     }
 
     #[test]
-    fn build_codex_config_env_rejects_invalid_isolation_metadata() {
+    fn build_codex_config_env_rejects_invalid_filesystem_metadata() {
         let extra = env(&[
             ("CODEX_CONFIG", GENERATED),
-            (CODEX_DENIED_READ_PATHS_ENV, "not-json"),
+            (CODEX_FILESYSTEM_PERMISSIONS_ENV, "not-json"),
         ]);
-        let error = build_codex_config_env(&extra, None, true).unwrap_err();
+        let error = build_codex_config_env(&extra, None, true, None).unwrap_err();
 
-        assert!(error.to_string().contains(CODEX_DENIED_READ_PATHS_ENV));
+        assert!(error.to_string().contains(CODEX_FILESYSTEM_PERMISSIONS_ENV));
     }
 
     #[test]
     fn build_codex_config_env_rejects_invalid_config_objects() {
         let invalid_persona =
-            isolated_env(&[("CODEX_CONFIG", "not-json"), ("CODEX_CONFIG", GENERATED)]);
-        assert!(build_codex_config_env(&invalid_persona, None, true).is_err());
+            permissioned_env(&[("CODEX_CONFIG", "not-json"), ("CODEX_CONFIG", GENERATED)]);
+        assert!(build_codex_config_env(&invalid_persona, None, true, None).is_err());
 
         let non_object_persona =
-            isolated_env(&[("CODEX_CONFIG", "[1,2,3]"), ("CODEX_CONFIG", GENERATED)]);
-        assert!(build_codex_config_env(&non_object_persona, None, true).is_err());
+            permissioned_env(&[("CODEX_CONFIG", "[1,2,3]"), ("CODEX_CONFIG", GENERATED)]);
+        assert!(build_codex_config_env(&non_object_persona, None, true, None).is_err());
 
-        let valid = isolated_env(&[("CODEX_CONFIG", GENERATED)]);
-        assert!(build_codex_config_env(&valid, Some("bad-json"), true).is_err());
+        let valid = permissioned_env(&[("CODEX_CONFIG", GENERATED)]);
+        assert!(build_codex_config_env(&valid, Some("bad-json"), true, None).is_err());
         let error =
-            build_codex_config_env(&valid, Some(r#"{"permissions":42}"#), true).unwrap_err();
+            build_codex_config_env(&valid, Some(r#"{"permissions":42}"#), true, None).unwrap_err();
         assert!(error.to_string().contains("permissions"));
     }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn spawn_consumes_isolation_metadata_instead_of_forwarding_it() {
-        let extra = isolated_env(&[]);
+    async fn spawn_consumes_filesystem_metadata_instead_of_forwarding_it() {
+        let extra = permissioned_env(&[]);
         let mut client = AcpClient::spawn(
             "sh",
             &[
                 "-c".to_string(),
-                format!(r#"printf '%s\n' "${{{CODEX_DENIED_READ_PATHS_ENV}-not-forwarded}}""#),
+                format!(r#"printf '%s\n' "${{{CODEX_FILESYSTEM_PERMISSIONS_ENV}-not-forwarded}}""#),
             ],
             &extra,
             false,

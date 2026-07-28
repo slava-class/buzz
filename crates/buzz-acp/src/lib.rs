@@ -3716,17 +3716,19 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
 
 fn agent_spawn_environment(config: &Config) -> Vec<(String, String)> {
     let mut environment = config.persona_env_vars.clone();
+    environment.retain(|(key, _)| key != acp::CODEX_FILESYSTEM_PERMISSIONS_ENV);
     if matches!(
         config::normalize_agent_command_identity(&config.agent_command).as_str(),
         "codex" | "codex-acp"
     ) {
-        let denied_paths = std::env::current_dir()
+        let filesystem_permissions = std::env::current_dir()
             .ok()
-            .and_then(|cwd| cwd.to_str().map(pool::world_agent_denied_read_paths))
+            .and_then(|cwd| cwd.to_str().map(pool::world_agent_filesystem_permissions))
             .unwrap_or_default();
         environment.push((
-            acp::CODEX_DENIED_READ_PATHS_ENV.to_string(),
-            serde_json::json!(denied_paths).to_string(),
+            acp::CODEX_FILESYSTEM_PERMISSIONS_ENV.to_string(),
+            serde_json::to_string(&filesystem_permissions)
+                .expect("World filesystem permission metadata is serializable"),
         ));
     }
     environment

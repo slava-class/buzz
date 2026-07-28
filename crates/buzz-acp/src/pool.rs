@@ -2421,13 +2421,16 @@ fn load_world_authority_registry(cwd: &str) -> buzz_core::world_view::WorldAutho
     registry
 }
 
-/// Filesystem paths that Codex-backed Buzz agents must not read directly.
+/// Filesystem authority exposed to a Codex-backed Buzz agent's local-exec
+/// sandbox.
 ///
-/// Agents receive scoped world state through the resolver and mutation
-/// authority through the harness. Keeping the registry, credential directory,
-/// and registered local source roots outside their filesystem view prevents a
-/// prompt from bypassing those typed boundaries.
-pub(crate) fn world_agent_denied_read_paths(cwd: &str) -> Vec<String> {
+/// Private registry and credential discovery stay denied. Registered local
+/// roots are explicit write-capable paths for canonical non-hosted `world`
+/// commands. Hosted commands use the Buzz workspace shell boundary named in
+/// the scoped prompt; credential files are deliberately not reopened here.
+pub(crate) fn world_agent_filesystem_permissions(
+    cwd: &str,
+) -> std::collections::BTreeMap<String, crate::acp::CodexFilesystemPathAccess> {
     use buzz_core::world_view::{
         WORLD_AUTHORITY_REGISTRY_FILE_NAME, WORLD_AUTHORITY_SECRET_DIRECTORY,
     };
@@ -2438,35 +2441,35 @@ pub(crate) fn world_agent_denied_read_paths(cwd: &str) -> Vec<String> {
         tracing::warn!(
             target: "channel_context::world_authority",
             %cwd,
-            "cannot isolate world authority paths from a non-absolute agent working directory",
+            "cannot scope world authority paths from a non-absolute agent working directory",
         );
-        return Vec::new();
+        return std::collections::BTreeMap::new();
     }
 
     let registry = load_world_authority_registry(cwd);
-    let mut denied_paths = vec![
+    let mut permissions = std::collections::BTreeMap::new();
+    for authority in registry.local_authorities {
+        permissions.insert(
+            authority.source_root,
+            crate::acp::CodexFilesystemPathAccess::Write,
+        );
+    }
+
+    // Insert exact private discovery paths last so a malformed registry cannot
+    // promote either path through an identical authority entry.
+    permissions.insert(
         root.join(WORLD_AUTHORITY_REGISTRY_FILE_NAME)
             .to_string_lossy()
             .into_owned(),
+        crate::acp::CodexFilesystemPathAccess::Deny,
+    );
+    permissions.insert(
         root.join(WORLD_AUTHORITY_SECRET_DIRECTORY)
             .to_string_lossy()
             .into_owned(),
-    ];
-    denied_paths.extend(
-        registry
-            .local_authorities
-            .iter()
-            .map(|authority| authority.source_root.clone()),
+        crate::acp::CodexFilesystemPathAccess::Deny,
     );
-    denied_paths.extend(
-        registry
-            .hosted_authorities
-            .iter()
-            .map(|authority| authority.credential_file.clone()),
-    );
-    denied_paths.sort_unstable();
-    denied_paths.dedup();
-    denied_paths
+    permissions
 }
 
 fn world_view_thread_root(batch: &FlushBatch) -> Option<String> {
@@ -2815,6 +2818,7 @@ fn render_world_view_bindings_section(
 
     let mut lines = vec![
         "[Shivai World Views]".to_string(),
+        "Command surface: run supplied commands through the Buzz workspace shell tool; do not substitute a sandboxed local-exec tool.".to_string(),
         format!(
             "Effective scope: {}",
             world_view_scope_label(&state.effective.effective_scope)
@@ -2960,13 +2964,19 @@ fn render_world_view_bindings_section(
         }
 
         match (&binding.reference, local_authority, hosted_authority) {
-            (WorldViewReference::LocalWorldMirrorLatest { .. }, Some(_), _) => {
+            (
+                WorldViewReference::LocalWorldMirrorLatest { .. },
+                Some(local_authority),
+                _,
+            ) => {
+                let root = shell_quote_world_argument(&local_authority.source_root);
+                lines.push("  Authority: mutable local world available to this agent.".into());
+                lines.push(format!("  World command target: --root {root}"));
+                lines.push(format!(
+                    "  Read current source: world context --json --root {root}"
+                ));
                 lines.push(
-                    "  Authority: host-held mutable local source; agent context is read-only."
-                        .into(),
-                );
-                lines.push(
-                    "  Mutation: requires an explicit host-approved World operation for this binding."
+                    "  Command access: canonical non-hosted `world` read and mutation commands are available for this root; follow each command's revision or edit-session contract."
                         .into(),
                 );
             }
@@ -2981,14 +2991,22 @@ fn render_world_view_bindings_section(
                 WorldViewReference::HostedWorldLatest { .. }
                 | WorldViewReference::HostedWorldLiveViewShare { .. },
                 _,
-                Some(_),
+                Some(hosted_authority),
             ) => {
-                lines.push(
-                    "  Authority: host-held mutable hosted world; agent context is read-only."
-                        .into(),
+                let hosted_options = format!(
+                    "--base-url {} --edit-share-file {} --anonymous-session",
+                    shell_quote_world_argument(&hosted_authority.origin),
+                    shell_quote_world_argument(&hosted_authority.credential_file),
                 );
+                lines.push("  Authority: mutable hosted world available to this agent.".into());
+                lines.push(format!(
+                    "  World hosted command options: {hosted_options}"
+                ));
+                lines.push(format!(
+                    "  Read current source: world hosted latest --json {hosted_options}"
+                ));
                 lines.push(
-                    "  Mutation: requires an explicit host-approved World operation for this binding."
+                    "  Command access: canonical `world hosted` read and mutation commands are available with those options; reread before mutating and pass the exact `--expected-revision` where required."
                         .into(),
                 );
             }
@@ -2998,12 +3016,16 @@ fn render_world_view_bindings_section(
                 _,
                 None,
             ) => lines.push(
-                "  Authority: read-only on this client; register the hosted edit-share URL here to enable host-approved operations."
+                "  Authority: read-only on this client; register the hosted edit-share URL here to enable agent command access."
                     .into(),
             ),
         }
     }
     lines.join("\n")
+}
+
+fn shell_quote_world_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn world_view_scope_label(scope: &buzz_core::world_view::WorldViewBindingScope) -> String {
@@ -6248,7 +6270,7 @@ mod tests {
     }
 
     #[test]
-    fn world_view_prompt_keeps_registered_local_mutation_authority_host_owned() {
+    fn world_view_prompt_exposes_registered_local_world_command_authority() {
         use buzz_core::world_view::{
             LocalWorldAuthority, WorldAuthorityRegistry, WorldViewBinding, WorldViewBindingScope,
             WorldViewBindingsDocument, WorldViewDisplayMode, WorldViewReference,
@@ -6325,17 +6347,17 @@ mod tests {
         assert!(section.contains(&format!("--binding {binding_id}")));
         assert!(section.contains("Effective scope: channel"));
         assert!(section.contains("Declaration: scope=channel binding-revision="));
+        assert!(section.contains("Authority: mutable local world available to this agent."));
+        assert!(section.contains("World command target: --root '/worlds/delivery.world'"));
         assert!(section
-            .contains("Authority: host-held mutable local source; agent context is read-only."));
-        assert!(section.contains(
-            "Mutation: requires an explicit host-approved World operation for this binding."
-        ));
-        assert!(!section.contains("/worlds/delivery.world"));
+            .contains("Read current source: world context --json --root '/worlds/delivery.world'"));
+        assert!(section
+            .contains("canonical non-hosted `world` read and mutation commands are available"));
         assert!(!section.contains("world hosted sync-local"));
     }
 
     #[test]
-    fn world_view_prompt_keeps_private_hosted_mutation_authority_host_owned() {
+    fn world_view_prompt_exposes_registered_hosted_world_command_authority() {
         use buzz_core::world_view::{
             EffectiveWorldViewBinding, EffectiveWorldViewBindings, HostedWorldAuthority,
             WorldAuthorityRegistry, WorldViewBinding, WorldViewBindingScope, WorldViewDisplayMode,
@@ -6389,28 +6411,44 @@ mod tests {
         let section =
             render_world_view_bindings_section(&state, &registry, &[(binding_id, Ok(resolved))]);
 
-        assert!(section
-            .contains("Authority: host-held mutable hosted world; agent context is read-only."));
+        assert!(section.contains("Authority: mutable hosted world available to this agent."));
         assert!(section.contains(
-            "Mutation: requires an explicit host-approved World operation for this binding."
+            "Command surface: run supplied commands through the Buzz workspace shell tool"
         ));
-        assert!(!section.contains("/credentials/hosted-1.edit-share"));
-        assert!(!section.contains("--edit-share-file"));
-        assert!(!section.contains("world hosted script"));
+        assert!(section.contains(
+            "World hosted command options: --base-url 'https://manifest.shivai.space' --edit-share-file '/credentials/hosted-1.edit-share' --anonymous-session"
+        ));
+        assert!(section.contains(
+            "Read current source: world hosted latest --json --base-url 'https://manifest.shivai.space' --edit-share-file '/credentials/hosted-1.edit-share' --anonymous-session"
+        ));
+        assert!(
+            section.contains("canonical `world hosted` read and mutation commands are available")
+        );
         assert!(!section.contains("edit-token"));
     }
+
     #[test]
-    fn world_agent_denied_read_paths_cover_registry_secrets_and_world_authorities() {
+    fn world_command_arguments_are_posix_shell_quoted() {
+        assert_eq!(
+            shell_quote_world_argument("/worlds/captain's log.world"),
+            "'/worlds/captain'\"'\"'s log.world'"
+        );
+    }
+
+    #[test]
+    fn world_agent_filesystem_permissions_deny_discovery_and_grant_local_sources() {
         use buzz_core::world_view::{
             HostedWorldAuthority, LocalWorldAuthority, WorldAuthorityRegistry,
             WORLD_AUTHORITY_REGISTRY_FILE_NAME, WORLD_AUTHORITY_REGISTRY_VERSION,
             WORLD_AUTHORITY_SECRET_DIRECTORY,
         };
 
-        let root = std::env::temp_dir().join(format!("buzz-acp-denied-paths-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("buzz-acp-permissions-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let local_source = root.join("private.world");
-        let hosted_credential = root.join("external.edit-share");
+        let hosted_credential = root
+            .join(WORLD_AUTHORITY_SECRET_DIRECTORY)
+            .join("hosted-1.edit-share");
         let registry = WorldAuthorityRegistry {
             version: WORLD_AUTHORITY_REGISTRY_VERSION,
             local_authorities: vec![LocalWorldAuthority {
@@ -6430,23 +6468,31 @@ mod tests {
         )
         .unwrap();
 
-        let mut expected = vec![
-            root.join(WORLD_AUTHORITY_REGISTRY_FILE_NAME)
-                .to_string_lossy()
-                .into_owned(),
-            root.join(WORLD_AUTHORITY_SECRET_DIRECTORY)
-                .to_string_lossy()
-                .into_owned(),
-            local_source.to_string_lossy().into_owned(),
-            hosted_credential.to_string_lossy().into_owned(),
-        ];
-        expected.sort_unstable();
-
+        let permissions = world_agent_filesystem_permissions(root.to_str().unwrap());
         assert_eq!(
-            world_agent_denied_read_paths(root.to_str().unwrap()),
-            expected
+            permissions.get(
+                &root
+                    .join(WORLD_AUTHORITY_REGISTRY_FILE_NAME)
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            Some(&crate::acp::CodexFilesystemPathAccess::Deny)
         );
-        assert!(world_agent_denied_read_paths("relative/nest").is_empty());
+        assert_eq!(
+            permissions.get(
+                &root
+                    .join(WORLD_AUTHORITY_SECRET_DIRECTORY)
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            Some(&crate::acp::CodexFilesystemPathAccess::Deny)
+        );
+        assert_eq!(
+            permissions.get(&local_source.to_string_lossy().into_owned()),
+            Some(&crate::acp::CodexFilesystemPathAccess::Write)
+        );
+        assert!(!permissions.contains_key(&hosted_credential.to_string_lossy().into_owned()));
+        assert!(world_agent_filesystem_permissions("relative/nest").is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
