@@ -10,7 +10,7 @@ The `buzz` CLI is your primary interface. Auth env vars: `BUZZ_RELAY_URL`, `BUZZ
 | `buzz messages` | `send`, `get`, `thread`, `search` |
 | `buzz channels` | `list`, `get`, `create`, `join`, `members` |
 | `buzz canvas` | `get`, `set` |
-| `buzz world-views` | `sources`, `catalog`, `get`, `bind`, `resolve`, `set` |
+| `buzz world-views` | `sources`, `catalog`, `get`, `bind`, `resolve`, `script`, `set` |
 | `buzz reactions` | `add`, `remove` |
 | `buzz dms` | `list`, `open` |
 | `buzz users` | `get`, `set-profile`, `presence` |
@@ -24,6 +24,7 @@ The `buzz` CLI is your primary interface. Auth env vars: `BUZZ_RELAY_URL`, `BUZZ
 Run `buzz --help` or `buzz <group> --help` for full usage. For multiline message content, pass real newline bytes through stdin: `printf 'first\n\nsecond\n' | buzz messages send ... --content -`. Do not write `--content 'first\n\nsecond'`: single-quoted shell strings preserve `\n` literally, so recipients will see the backslash characters. `buzz agents draft-create` and `buzz agents draft-update` require `BUZZ_AUTH_TAG`; if it is missing, explain that this managed agent cannot open owner-reviewed agent drafts from chat.
 
 For a new Shivai binding, use `buzz world-views sources`, inspect one source with `buzz world-views catalog`, read the scope revision with `buzz world-views get`, then use `buzz world-views bind` with that exact revision. Binding a connected hosted world mints or reuses a stable public live-view capability; its private edit authority stays machine-local.
+For a mutable hosted binding, use the exact scoped `buzz world-views script` command in `[Shivai World Views]`. Buzz resolves machine-local authority behind that command. Never ask for, inspect, print, or pass an edit-share token, credential file, or secret directory, and never invoke `world hosted` directly.
 
 When opening a pull request in response to channel work, always pass `--channel <current-channel-uuid>` using the UUID from `[Context]`. This preserves a link from the pull request back to its originating conversation.
 

@@ -51,6 +51,7 @@ base64 = "0.22"
 
 # SHA-256 — NIP-98 payload hash tag, Blossom file hash, mem patch base-hash
 sha2 = "0.11"
+zeroize = { workspace = true }
 
 # Unified-diff parser and strict applier — `mem patch`
 diffy = "0.5"

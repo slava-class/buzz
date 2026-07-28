@@ -251,7 +251,7 @@ pub enum WorldViewResolutionError {
         #[source]
         source: std::io::Error,
     },
-    #[error("could not send the hosted view capability to `{binary}` over stdin: {source}")]
+    #[error("could not send private Shivai world input to `{binary}` over stdin: {source}")]
     Input {
         binary: PathBuf,
         #[source]
@@ -259,6 +259,8 @@ pub enum WorldViewResolutionError {
     },
     #[error("Shivai world-view resolution failed: {0}")]
     CommandFailed(String),
+    #[error("Shivai hosted-world revision conflict: {0}")]
+    RevisionConflict(String),
     #[error("Shivai world resolver returned invalid JSON: {0}")]
     Decode(#[from] serde_json::Error),
     #[error("Shivai world resolver returned an invalid result: {0}")]
@@ -489,13 +491,7 @@ async fn run_world_cli_invocation(
             reference,
             access,
         );
-        return Err(WorldViewResolutionError::CommandFailed(
-            if diagnostics.is_empty() {
-                "the command exited without diagnostics".into()
-            } else {
-                diagnostics
-            },
-        ));
+        return Err(command_failure(diagnostics));
     }
     Ok(output.stdout)
 }
@@ -543,13 +539,7 @@ pub async fn inspect_hosted_edit_share_with_binary(
             String::from_utf8_lossy(&output.stderr).trim(),
             credential_file.as_ref(),
         );
-        return Err(WorldViewResolutionError::CommandFailed(
-            if diagnostics.is_empty() {
-                "the command exited without diagnostics".into()
-            } else {
-                diagnostics
-            },
-        ));
+        return Err(command_failure(diagnostics));
     }
 
     let envelope: WorldResultEnvelope<WorldHostedLatestResult> =
@@ -576,6 +566,115 @@ pub async fn inspect_hosted_edit_share_with_binary(
         hosted_world_id: result.projection.hosted_world_id,
         revision: result.revision,
     })
+}
+
+/// Apply one revision-checked hosted WorldLang script through machine-local
+/// edit authority without exposing the credential path to the caller.
+pub async fn apply_hosted_world_script(
+    origin: &str,
+    hosted_world_id: &str,
+    credential_file: impl AsRef<Path>,
+    expected_revision: &str,
+    script: &str,
+) -> Result<serde_json::Value, WorldViewResolutionError> {
+    let binary = std::env::var_os("SHIVAI_WORLD_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("world"));
+    apply_hosted_world_script_with_binary(
+        origin,
+        hosted_world_id,
+        credential_file,
+        expected_revision,
+        script,
+        binary,
+    )
+    .await
+}
+
+/// Apply one revision-checked hosted WorldLang script through an explicit
+/// source `world` binary.
+pub async fn apply_hosted_world_script_with_binary(
+    origin: &str,
+    hosted_world_id: &str,
+    credential_file: impl AsRef<Path>,
+    expected_revision: &str,
+    script: &str,
+    binary: impl AsRef<Path>,
+) -> Result<serde_json::Value, WorldViewResolutionError> {
+    let credential_file = credential_file.as_ref();
+    let binary = binary.as_ref();
+    validate_event_id("expectedRevision", expected_revision)?;
+    if script.trim().is_empty() {
+        return Err(WorldViewResolutionError::InvalidRequest(
+            "hosted world script must not be blank".into(),
+        ));
+    }
+
+    let inspection = inspect_hosted_edit_share_with_binary(origin, credential_file, binary).await?;
+    if inspection.hosted_world_id != hosted_world_id {
+        return Err(WorldViewResolutionError::InvalidResult(format!(
+            "the private authority resolved hosted world `{}` instead of `{hosted_world_id}`",
+            inspection.hosted_world_id
+        )));
+    }
+    if inspection.revision != expected_revision {
+        return Err(WorldViewResolutionError::RevisionConflict(format!(
+            "expected revision `{expected_revision}`, current revision `{}`; no mutation was attempted",
+            inspection.revision
+        )));
+    }
+
+    let reference = WorldViewReference::HostedWorldLatest {
+        origin: origin.to_owned(),
+        hosted_world_id: hosted_world_id.to_owned(),
+    };
+    reference
+        .validate()
+        .map_err(WorldViewResolutionError::InvalidRequest)?;
+    let access = WorldViewResolutionAccess::HostedEditShareFile {
+        credential_file: credential_file.to_owned(),
+    };
+    let invocation = WorldCliInvocation {
+        args: vec![
+            "hosted".into(),
+            "script".into(),
+            "--json".into(),
+            "--base-url".into(),
+            origin.into(),
+            "--edit-share-file".into(),
+            credential_file.to_string_lossy().into_owned(),
+            "--anonymous-session".into(),
+            "--expected-revision".into(),
+            expected_revision.into(),
+            "--stdin".into(),
+        ],
+        stdin: Some(script),
+    };
+    let stdout = run_world_cli_invocation(binary, invocation, &reference, &access).await?;
+    let mut envelope: serde_json::Value = serde_json::from_slice(&stdout)?;
+    if envelope.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return invalid_result("the hosted script returned a non-success envelope");
+    }
+    let result = envelope
+        .get("result")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            WorldViewResolutionError::InvalidResult(
+                "the hosted script success envelope omitted `result`".into(),
+            )
+        })?;
+    if result.get("command").and_then(serde_json::Value::as_str) != Some("hosted script") {
+        return invalid_result("the hosted script result carried an unexpected command");
+    }
+    if result
+        .get("revision")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return invalid_result("the hosted script result omitted its revision");
+    }
+    redact_credential_file_path_in_json(&mut envelope, credential_file);
+    Ok(envelope)
 }
 
 /// Mint or reuse a stable public live-view share using `SHIVAI_WORLD_BIN`.
@@ -1037,6 +1136,33 @@ fn redact_diagnostics(
             redact_credential_file_path(&diagnostics, credential_file)
         }
         WorldViewResolutionAccess::None => diagnostics,
+    }
+}
+
+fn command_failure(diagnostics: String) -> WorldViewResolutionError {
+    if diagnostics.contains("world.hosted.revision_conflict") {
+        WorldViewResolutionError::RevisionConflict(diagnostics)
+    } else {
+        WorldViewResolutionError::CommandFailed(diagnostics)
+    }
+}
+
+fn redact_credential_file_path_in_json(value: &mut serde_json::Value, credential_file: &Path) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = redact_credential_file_path(text, credential_file);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_credential_file_path_in_json(value, credential_file);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_credential_file_path_in_json(value, credential_file);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -1518,5 +1644,179 @@ mod tests {
             }
         );
         std::fs::remove_dir_all(temp_root).expect("remove temp resolver root");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn applies_scoped_hosted_script_without_returning_credential_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_root = std::env::temp_dir().join(format!("buzz-hosted-script-{}", Uuid::new_v4()));
+        std::fs::create_dir(&temp_root).expect("create temp hosted script root");
+        let credential_file = temp_root.join("authority.edit-share");
+        std::fs::write(&credential_file, "private-edit-share")
+            .expect("write private authority fixture");
+        let expected_revision = "a".repeat(64);
+        let next_revision = "b".repeat(64);
+        let latest_output = temp_root.join("latest.json");
+        std::fs::write(
+            &latest_output,
+            serde_json::to_vec(&json!({
+                "ok": true,
+                "result": {
+                    "projection": { "hostedWorldId": "hosted-1" },
+                    "revision": expected_revision,
+                }
+            }))
+            .expect("encode latest output"),
+        )
+        .expect("write latest output");
+        let script_output = temp_root.join("script.json");
+        std::fs::write(
+            &script_output,
+            serde_json::to_vec(&json!({
+                "ok": true,
+                "result": {
+                    "command": "hosted script",
+                    "credentialPathDiagnostic": credential_file,
+                    "revision": next_revision,
+                    "script": { "lineCount": 1 },
+                }
+            }))
+            .expect("encode script output"),
+        )
+        .expect("write script output");
+        let captured_stdin = temp_root.join("stdin.txt");
+        let captured_args = temp_root.join("args.txt");
+        let binary_path = temp_root.join("world");
+        std::fs::write(
+            &binary_path,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = hosted ] && [ \"$2\" = latest ]; then\n\
+                   cat '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 if [ \"$1\" = hosted ] && [ \"$2\" = script ]; then\n\
+                   printf '%s\\n' \"$@\" > '{}'\n\
+                   cat > '{}'\n\
+                   cat '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 exit 42\n",
+                latest_output.display(),
+                captured_args.display(),
+                captured_stdin.display(),
+                script_output.display(),
+            ),
+        )
+        .expect("write fake world binary");
+        let mut permissions = std::fs::metadata(&binary_path)
+            .expect("read fake world metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&binary_path, permissions).expect("make fake world executable");
+
+        let script = "world add --disconnected \"Scoped triage\"";
+        let result = apply_hosted_world_script_with_binary(
+            "https://manifest.shivai.space",
+            "hosted-1",
+            &credential_file,
+            &expected_revision,
+            script,
+            &binary_path,
+        )
+        .await
+        .expect("apply hosted script");
+
+        assert_eq!(
+            result
+                .pointer("/result/revision")
+                .and_then(serde_json::Value::as_str),
+            Some(next_revision.as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&captured_stdin).expect("read captured script"),
+            script
+        );
+        let args = std::fs::read_to_string(&captured_args).expect("read captured arguments");
+        assert!(args.contains("--edit-share-file"));
+        assert!(args.contains(&credential_file.to_string_lossy().to_string()));
+        let encoded = serde_json::to_string(&result).expect("encode broker result");
+        assert!(!encoded.contains(&credential_file.to_string_lossy().to_string()));
+        assert!(encoded.contains("<redacted-credential-file>"));
+        assert!(!encoded.contains("private-edit-share"));
+        std::fs::remove_dir_all(temp_root).expect("remove temp hosted script root");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_hosted_script_revision_never_launches_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_root = std::env::temp_dir().join(format!("buzz-hosted-stale-{}", Uuid::new_v4()));
+        std::fs::create_dir(&temp_root).expect("create temp stale script root");
+        let credential_file = temp_root.join("authority.edit-share");
+        std::fs::write(&credential_file, "private-edit-share")
+            .expect("write private authority fixture");
+        let expected_revision = "a".repeat(64);
+        let current_revision = "b".repeat(64);
+        let latest_output = temp_root.join("latest.json");
+        std::fs::write(
+            &latest_output,
+            serde_json::to_vec(&json!({
+                "ok": true,
+                "result": {
+                    "projection": { "hostedWorldId": "hosted-1" },
+                    "revision": current_revision,
+                }
+            }))
+            .expect("encode latest output"),
+        )
+        .expect("write latest output");
+        let mutation_marker = temp_root.join("mutation-ran");
+        let binary_path = temp_root.join("world");
+        std::fs::write(
+            &binary_path,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = hosted ] && [ \"$2\" = latest ]; then\n\
+                   cat '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 if [ \"$1\" = hosted ] && [ \"$2\" = script ]; then\n\
+                   touch '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 exit 42\n",
+                latest_output.display(),
+                mutation_marker.display(),
+            ),
+        )
+        .expect("write fake world binary");
+        let mut permissions = std::fs::metadata(&binary_path)
+            .expect("read fake world metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&binary_path, permissions).expect("make fake world executable");
+
+        let error = apply_hosted_world_script_with_binary(
+            "https://manifest.shivai.space",
+            "hosted-1",
+            &credential_file,
+            &expected_revision,
+            "world add --disconnected \"Stale triage\"",
+            &binary_path,
+        )
+        .await
+        .expect_err("stale revision must fail");
+
+        assert!(matches!(
+            error,
+            WorldViewResolutionError::RevisionConflict(_)
+        ));
+        assert!(error.to_string().contains(&current_revision));
+        assert!(!mutation_marker.exists());
+        std::fs::remove_dir_all(temp_root).expect("remove temp stale script root");
     }
 }

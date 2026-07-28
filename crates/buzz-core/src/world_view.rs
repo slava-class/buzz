@@ -2,8 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use hmac::{Hmac, KeyInit, Mac};
 use nostr::{Event, EventId};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use uuid::Uuid;
 
 /// Current serialized scoped world-view binding document version.
@@ -18,6 +20,10 @@ pub const WORLD_AUTHORITY_REGISTRY_VERSION: u8 = 2;
 pub const WORLD_AUTHORITY_REGISTRY_FILE_NAME: &str = "world-authorities.json";
 /// Private credential directory stored beside the authority registry.
 pub const WORLD_AUTHORITY_SECRET_DIRECTORY: &str = "world-authority-secrets";
+/// Version prefix for host-minted, revision-scoped world authority grants.
+pub const WORLD_AUTHORITY_GRANT_VERSION: u8 = 1;
+/// Short lifetime for prompt-carried grants before a fresh turn must remint.
+pub const WORLD_AUTHORITY_GRANT_TTL_SECONDS: i64 = 15 * 60;
 
 /// Private machine-local mappings from public world identities to mutation authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +234,129 @@ impl Default for WorldViewBindingScope {
     fn default() -> Self {
         Self::Channel
     }
+}
+
+/// Opaque grant scope signed by the host from private world authority.
+///
+/// Every field is immutable input to the signature. A grant therefore cannot
+/// be retargeted to another agent, conversation scope, binding revision, or
+/// world source revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorldAuthorityGrantScope {
+    /// Managed Buzz agent allowed to exercise the grant.
+    pub agent_pubkey: String,
+    /// Channel containing the effective binding.
+    pub channel_id: Uuid,
+    /// Exact channel or thread scope active for this turn.
+    pub effective_scope: WorldViewBindingScope,
+    /// Opaque public binding id resolved by the host.
+    pub binding_id: Uuid,
+    /// Nostr event revision that defined the effective binding.
+    pub binding_revision_event_id: String,
+    /// Hosted package revision accepted by the mutation.
+    pub source_revision: String,
+}
+
+impl WorldAuthorityGrantScope {
+    /// Validate every identity included in a host grant.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_nostr_event_id("grant.agentPubkey", &self.agent_pubkey)?;
+        self.effective_scope.validate()?;
+        validate_nostr_event_id(
+            "grant.bindingRevisionEventId",
+            &self.binding_revision_event_id,
+        )?;
+        validate_nostr_event_id("grant.sourceRevision", &self.source_revision)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorldAuthorityGrantClaims {
+    expires_at_unix_seconds: i64,
+    scope: WorldAuthorityGrantScope,
+}
+
+/// Mint one opaque, expiring grant from private authority material.
+///
+/// The token contains only signed public scope data. It never contains the
+/// private edit-share value used as the HMAC key.
+pub fn issue_world_authority_grant(
+    scope: &WorldAuthorityGrantScope,
+    authority_secret: &[u8],
+    expires_at_unix_seconds: i64,
+) -> Result<String, String> {
+    scope.validate()?;
+    if authority_secret.is_empty() {
+        return Err("world authority secret must not be empty".into());
+    }
+    if expires_at_unix_seconds <= 0 {
+        return Err("world authority grant expiry must be positive".into());
+    }
+    let payload = serde_json::to_vec(&WorldAuthorityGrantClaims {
+        expires_at_unix_seconds,
+        scope: scope.clone(),
+    })
+    .map_err(|error| format!("encode world authority grant: {error}"))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(authority_secret)
+        .map_err(|_| "world authority secret is invalid".to_owned())?;
+    mac.update(&payload);
+    let signature = mac.finalize().into_bytes();
+    Ok(format!(
+        "wvg{}.{}.{}",
+        WORLD_AUTHORITY_GRANT_VERSION,
+        hex::encode(payload),
+        hex::encode(signature)
+    ))
+}
+
+/// Verify that an unexpired opaque host grant authorizes one exact scope.
+pub fn verify_world_authority_grant(
+    token: &str,
+    authority_secret: &[u8],
+    expected_scope: &WorldAuthorityGrantScope,
+    now_unix_seconds: i64,
+) -> Result<(), String> {
+    expected_scope.validate()?;
+    if authority_secret.is_empty() || token.len() > 16_384 {
+        return Err("invalid world authority grant".into());
+    }
+    let mut parts = token.split('.');
+    let expected_prefix = format!("wvg{}", WORLD_AUTHORITY_GRANT_VERSION);
+    if parts.next() != Some(expected_prefix.as_str()) {
+        return Err("invalid world authority grant".into());
+    }
+    let payload = parts
+        .next()
+        .ok_or_else(|| "invalid world authority grant".to_owned())
+        .and_then(|value| {
+            hex::decode(value).map_err(|_| "invalid world authority grant".to_owned())
+        })?;
+    let signature = parts
+        .next()
+        .ok_or_else(|| "invalid world authority grant".to_owned())
+        .and_then(|value| {
+            hex::decode(value).map_err(|_| "invalid world authority grant".to_owned())
+        })?;
+    if parts.next().is_some() {
+        return Err("invalid world authority grant".into());
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(authority_secret)
+        .map_err(|_| "invalid world authority grant".to_owned())?;
+    mac.update(&payload);
+    mac.verify_slice(&signature)
+        .map_err(|_| "invalid world authority grant".to_owned())?;
+    let claims: WorldAuthorityGrantClaims =
+        serde_json::from_slice(&payload).map_err(|_| "invalid world authority grant".to_owned())?;
+    claims.scope.validate()?;
+    if &claims.scope != expected_scope {
+        return Err("world authority grant does not match this request".into());
+    }
+    if now_unix_seconds >= claims.expires_at_unix_seconds {
+        return Err("world authority grant expired".into());
+    }
+    Ok(())
 }
 
 /// One exact-scope document containing every bound Shivai world view.
@@ -981,6 +1110,72 @@ mod tests {
         assert_eq!(
             document.validate(),
             Err(format!("duplicate world view binding id: {id}"))
+        );
+    }
+
+    #[test]
+    fn world_authority_grant_is_exactly_agent_scope_binding_and_revision_bound() {
+        let scope = WorldAuthorityGrantScope {
+            agent_pubkey: "a".repeat(64),
+            channel_id: Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            effective_scope: WorldViewBindingScope::thread("b".repeat(64)).unwrap(),
+            binding_id: Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            binding_revision_event_id: "c".repeat(64),
+            source_revision: "d".repeat(64),
+        };
+        let token = issue_world_authority_grant(&scope, b"private-edit-share", 200).unwrap();
+
+        assert!(verify_world_authority_grant(&token, b"private-edit-share", &scope, 100,).is_ok());
+        assert!(!token.contains("private-edit-share"));
+
+        let mut another_agent = scope.clone();
+        another_agent.agent_pubkey = "e".repeat(64);
+        assert_eq!(
+            verify_world_authority_grant(&token, b"private-edit-share", &another_agent, 100,),
+            Err("world authority grant does not match this request".into())
+        );
+
+        let mut another_scope = scope.clone();
+        another_scope.effective_scope = WorldViewBindingScope::Channel;
+        assert!(
+            verify_world_authority_grant(&token, b"private-edit-share", &another_scope, 100,)
+                .is_err()
+        );
+
+        let mut another_revision = scope.clone();
+        another_revision.source_revision = "f".repeat(64);
+        assert!(verify_world_authority_grant(
+            &token,
+            b"private-edit-share",
+            &another_revision,
+            100,
+        )
+        .is_err());
+        assert_eq!(
+            verify_world_authority_grant(&token, b"private-edit-share", &scope, 200,),
+            Err("world authority grant expired".into())
+        );
+    }
+
+    #[test]
+    fn world_authority_grant_rejects_tampering() {
+        let scope = WorldAuthorityGrantScope {
+            agent_pubkey: "a".repeat(64),
+            channel_id: Uuid::nil(),
+            effective_scope: WorldViewBindingScope::Channel,
+            binding_id: Uuid::nil(),
+            binding_revision_event_id: "b".repeat(64),
+            source_revision: "c".repeat(64),
+        };
+        let token = issue_world_authority_grant(&scope, b"private-edit-share", 200).unwrap();
+        let mut tampered = token.into_bytes();
+        let last = tampered.last_mut().unwrap();
+        *last = if *last == b'0' { b'1' } else { b'0' };
+        let tampered = String::from_utf8(tampered).unwrap();
+
+        assert_eq!(
+            verify_world_authority_grant(&tampered, b"private-edit-share", &scope, 100,),
+            Err("invalid world authority grant".into())
         );
     }
 }

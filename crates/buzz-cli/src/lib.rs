@@ -773,6 +773,27 @@ pub enum WorldViewsCmd {
         #[arg(long)]
         binding: Option<String>,
     },
+    /// Apply one revision-checked script through host-owned authority
+    Script {
+        /// Channel UUID whose effective binding authorizes the target
+        #[arg(long)]
+        channel: String,
+        /// Exact thread-root event id; omit for a channel-scoped operation
+        #[arg(long)]
+        thread_root: Option<String>,
+        /// Exact binding UUID; resolved by the host instead of the agent
+        #[arg(long)]
+        binding: String,
+        /// Current hosted package revision from `world-views resolve`
+        #[arg(long)]
+        expected_revision: String,
+        /// WorldLang command document (use '-' to read from stdin)
+        #[arg(long)]
+        script: String,
+        /// Opaque agent/channel/binding/revision grant from the host prompt
+        #[arg(long)]
+        grant: String,
+    },
 }
 
 #[derive(Subcommand)]

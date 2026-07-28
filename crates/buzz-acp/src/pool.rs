@@ -1431,12 +1431,14 @@ pub async fn run_prompt_task(
             .unwrap_or(true);
         if !is_dm {
             let authorities = load_world_authority_registry(&ctx.cwd);
+            let agent_pubkey = ctx.agent_keys.public_key().to_hex();
             let thread_root_event_id = batch.as_ref().and_then(world_view_thread_root);
             current_world_views = fetch_world_view_bindings_section(
                 *cid,
                 thread_root_event_id.as_deref(),
                 &ctx.rest_client,
                 &authorities,
+                &agent_pubkey,
             )
             .await;
             if is_new_channel_session && !agent.state.canvas_sections.contains_key(cid) {
@@ -2508,6 +2510,7 @@ async fn fetch_world_view_bindings_section(
     thread_root_event_id: Option<&str>,
     rest: &RestClient,
     authorities: &buzz_core::world_view::WorldAuthorityRegistry,
+    agent_pubkey: &str,
 ) -> Option<String> {
     use buzz_core::world_view::{
         effective_world_view_bindings, WorldViewBindingScope, WorldViewBindingsSnapshot,
@@ -2595,11 +2598,96 @@ async fn fetch_world_view_bindings_section(
             }
         }))
         .await;
+    let authority_grants = issue_hosted_world_authority_grants(
+        channel_id,
+        agent_pubkey,
+        &state,
+        authorities,
+        &resolutions,
+    );
     Some(render_world_view_bindings_section(
         &state,
         authorities,
         &resolutions,
+        &authority_grants,
     ))
+}
+
+fn issue_hosted_world_authority_grants(
+    channel_id: Uuid,
+    agent_pubkey: &str,
+    state: &EffectiveWorldViewBindingsPromptState,
+    authorities: &buzz_core::world_view::WorldAuthorityRegistry,
+    resolutions: &[(
+        Uuid,
+        Result<buzz_world_view_resolver::ResolvedWorldView, String>,
+    )],
+) -> std::collections::HashMap<Uuid, String> {
+    use buzz_core::world_view::{
+        issue_world_authority_grant, WorldAuthorityGrantScope, WORLD_AUTHORITY_GRANT_TTL_SECONDS,
+    };
+    use buzz_world_view_resolver::WorldViewResolutionAuthority;
+    use zeroize::Zeroizing;
+
+    let mut grants = std::collections::HashMap::with_capacity(resolutions.len());
+    let expires_at_unix_seconds =
+        chrono::Utc::now().timestamp() + WORLD_AUTHORITY_GRANT_TTL_SECONDS;
+    for entry in &state.effective.bindings {
+        let Some(Ok(resolved)) = resolutions
+            .iter()
+            .find(|(binding_id, _)| binding_id == &entry.binding.id)
+            .map(|(_, resolution)| resolution)
+        else {
+            continue;
+        };
+        let (origin, hosted_world_id) = match &resolved.authority {
+            WorldViewResolutionAuthority::HostedWorldLatest {
+                origin,
+                hosted_world_id,
+            }
+            | WorldViewResolutionAuthority::HostedWorldLiveViewShare {
+                origin,
+                hosted_world_id,
+            } => (origin, hosted_world_id),
+            WorldViewResolutionAuthority::HostedWorldViewExport { .. }
+            | WorldViewResolutionAuthority::LocalWorldMirrorLatest { .. } => continue,
+        };
+        let Some(authority) = authorities.resolve_hosted(origin, hosted_world_id) else {
+            continue;
+        };
+        let authority_secret = match std::fs::read(&authority.credential_file) {
+            Ok(secret) => Zeroizing::new(secret),
+            Err(error) => {
+                tracing::warn!(
+                    binding_id = %entry.binding.id,
+                    error = %error,
+                    "could not read private hosted authority while minting scoped grant"
+                );
+                continue;
+            }
+        };
+        let scope = WorldAuthorityGrantScope {
+            agent_pubkey: agent_pubkey.to_owned(),
+            channel_id,
+            effective_scope: state.effective.effective_scope.clone(),
+            binding_id: entry.binding.id,
+            binding_revision_event_id: entry.binding_revision_event_id.clone(),
+            source_revision: resolved.source_revision.clone(),
+        };
+        match issue_world_authority_grant(&scope, &authority_secret, expires_at_unix_seconds) {
+            Ok(grant) => {
+                grants.insert(entry.binding.id, grant);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    binding_id = %entry.binding.id,
+                    error = %error,
+                    "could not mint scoped hosted world authority grant"
+                );
+            }
+        }
+    }
+    grants
 }
 
 /// Parse a canvas query response array and render a `[Channel Canvas]` section.
@@ -2812,6 +2900,7 @@ fn render_world_view_bindings_section(
         Uuid,
         Result<buzz_world_view_resolver::ResolvedWorldView, String>,
     )],
+    authority_grants: &std::collections::HashMap<Uuid, String>,
 ) -> String {
     use buzz_core::world_view::{WorldViewBindingScope, WorldViewDisplayMode, WorldViewReference};
     use buzz_world_view_resolver::{WorldViewResolutionAuthority, WorldViewResolutionFreshness};
@@ -2855,6 +2944,9 @@ fn render_world_view_bindings_section(
             .iter()
             .find(|(binding_id, _)| binding_id == &binding.id)
             .map(|(_, resolution)| resolution);
+        let resolved_source_revision = resolution
+            .and_then(|resolution| resolution.as_ref().ok())
+            .map(|resolved| resolved.source_revision.as_str());
         let local_authority = match &binding.reference {
             WorldViewReference::LocalWorldMirrorLatest { origin, mirror_id } => {
                 authorities.resolve_local(origin, mirror_id)
@@ -2991,24 +3083,37 @@ fn render_world_view_bindings_section(
                 WorldViewReference::HostedWorldLatest { .. }
                 | WorldViewReference::HostedWorldLiveViewShare { .. },
                 _,
-                Some(hosted_authority),
+                Some(_),
             ) => {
-                let hosted_options = format!(
-                    "--base-url {} --edit-share-file {} --anonymous-session",
-                    shell_quote_world_argument(&hosted_authority.origin),
-                    shell_quote_world_argument(&hosted_authority.credential_file),
-                );
-                lines.push("  Authority: mutable hosted world available to this agent.".into());
-                lines.push(format!(
-                    "  World hosted command options: {hosted_options}"
-                ));
-                lines.push(format!(
-                    "  Read current source: world hosted latest --json {hosted_options}"
-                ));
-                lines.push(
-                    "  Command access: canonical `world hosted` read and mutation commands are available with those options; reread before mutating and pass the exact `--expected-revision` where required."
-                        .into(),
-                );
+                match (
+                    resolved_source_revision,
+                    authority_grants.get(&binding.id),
+                ) {
+                    (Some(source_revision), Some(authority_grant)) => {
+                        let script_command = scoped_world_view_script_command(
+                            &state.channel_uuid,
+                            &state.effective.effective_scope,
+                            binding.id,
+                            source_revision,
+                            authority_grant,
+                        );
+                        lines.push(
+                            "  Authority: mutable hosted world available through a host-owned scoped command."
+                                .into(),
+                        );
+                        lines.push(format!("  Mutation command: {script_command}"));
+                        lines.push(
+                            "  Command access: pipe ordinary `world ...` lines to this command. Buzz resolves private machine-local authority from the agent/channel/thread/revision grant; never request or print credentials. On a revision conflict, reread the binding and make one deliberate retry with the refreshed command."
+                                .into(),
+                        );
+                    }
+                    _ => {
+                        lines.push(
+                            "  Authority: machine-local hosted edit authority is registered, but mutation is unavailable until the binding resolves and the host mints a scoped grant."
+                                .into(),
+                        );
+                    }
+                }
             }
             (
                 WorldViewReference::HostedWorldLatest { .. }
@@ -3022,6 +3127,27 @@ fn render_world_view_bindings_section(
         }
     }
     lines.join("\n")
+}
+
+fn scoped_world_view_script_command(
+    channel_id: &str,
+    scope: &buzz_core::world_view::WorldViewBindingScope,
+    binding_id: Uuid,
+    source_revision: &str,
+    authority_grant: &str,
+) -> String {
+    let mut command = format!("buzz world-views script --channel {channel_id}");
+    if let Some(thread_root_event_id) = scope.thread_root_event_id() {
+        command.push_str(" --thread-root ");
+        command.push_str(thread_root_event_id);
+    }
+    command.push_str(" --binding ");
+    command.push_str(&binding_id.to_string());
+    command.push_str(" --expected-revision ");
+    command.push_str(source_revision);
+    command.push_str(" --script - --grant ");
+    command.push_str(authority_grant);
+    command
 }
 
 fn shell_quote_world_argument(value: &str) -> String {
@@ -6215,9 +6341,10 @@ mod tests {
         binding_id: Uuid,
         authority: serde_json::Value,
     ) -> buzz_world_view_resolver::ResolvedWorldView {
+        let source_revision = "c".repeat(64);
         let presentation_model = serde_json::json!({
             "graph": { "kind": "empty", "reason": "no-preferences" },
-            "revision": "source-revision-1",
+            "revision": source_revision.clone(),
             "selection": {
                 "realmQualifiedName": "delivery::main",
                 "viewQualifiedName": "delivery::main::@Remaining"
@@ -6230,7 +6357,7 @@ mod tests {
             "declaredScope": { "kind": "channel" },
             "effectiveScope": { "kind": "channel" },
             "bindingRevisionEventId": "a".repeat(64),
-            "sourceRevision": "source-revision-1",
+            "sourceRevision": source_revision,
             "freshness": "latest-at-resolution",
             "authority": authority,
             "realm": {
@@ -6341,8 +6468,12 @@ mod tests {
                 "mirrorId": "mirror-1"
             }),
         );
-        let section =
-            render_world_view_bindings_section(&state, &registry, &[(binding_id, Ok(resolved))]);
+        let section = render_world_view_bindings_section(
+            &state,
+            &registry,
+            &[(binding_id, Ok(resolved))],
+            &std::collections::HashMap::new(),
+        );
 
         assert!(section.contains(&format!("--binding {binding_id}")));
         assert!(section.contains("Effective scope: channel"));
@@ -6357,11 +6488,12 @@ mod tests {
     }
 
     #[test]
-    fn world_view_prompt_exposes_registered_hosted_world_command_authority() {
+    fn world_view_prompt_renders_scoped_hosted_world_command() {
         use buzz_core::world_view::{
-            EffectiveWorldViewBinding, EffectiveWorldViewBindings, HostedWorldAuthority,
-            WorldAuthorityRegistry, WorldViewBinding, WorldViewBindingScope, WorldViewDisplayMode,
-            WorldViewReference, WORLD_AUTHORITY_REGISTRY_VERSION,
+            verify_world_authority_grant, EffectiveWorldViewBinding, EffectiveWorldViewBindings,
+            HostedWorldAuthority, WorldAuthorityGrantScope, WorldAuthorityRegistry,
+            WorldViewBinding, WorldViewBindingScope, WorldViewDisplayMode, WorldViewReference,
+            WORLD_AUTHORITY_REGISTRY_VERSION,
         };
 
         let binding_id = Uuid::nil();
@@ -6390,13 +6522,18 @@ mod tests {
             timestamp: "2026-07-24T12:00:00Z".into(),
             channel_uuid: CHANNEL_UUID.into(),
         };
+        let authority_root =
+            std::env::temp_dir().join(format!("buzz-acp-world-grant-{}", Uuid::new_v4()));
+        std::fs::create_dir(&authority_root).expect("create authority fixture root");
+        let credential_file = authority_root.join("hosted-1.edit-share");
+        std::fs::write(&credential_file, "private-edit-share").expect("write authority fixture");
         let registry = WorldAuthorityRegistry {
             version: WORLD_AUTHORITY_REGISTRY_VERSION,
             local_authorities: Vec::new(),
             hosted_authorities: vec![HostedWorldAuthority {
                 origin: "https://manifest.shivai.space".into(),
                 hosted_world_id: "hosted-1".into(),
-                credential_file: "/credentials/hosted-1.edit-share".into(),
+                credential_file: credential_file.to_string_lossy().into_owned(),
             }],
         };
         let resolved = empty_resolved_world_view(
@@ -6408,23 +6545,53 @@ mod tests {
             }),
         );
 
+        let resolutions = vec![(binding_id, Ok(resolved))];
+        let agent_pubkey = "d".repeat(64);
+        let authority_grants = issue_hosted_world_authority_grants(
+            Uuid::parse_str(CHANNEL_UUID).unwrap(),
+            &agent_pubkey,
+            &state,
+            &registry,
+            &resolutions,
+        );
+        let authority_grant = authority_grants
+            .get(&binding_id)
+            .expect("host issued scoped grant");
+        verify_world_authority_grant(
+            authority_grant,
+            b"private-edit-share",
+            &WorldAuthorityGrantScope {
+                agent_pubkey,
+                channel_id: Uuid::parse_str(CHANNEL_UUID).unwrap(),
+                effective_scope: WorldViewBindingScope::Channel,
+                binding_id,
+                binding_revision_event_id: "a".repeat(64),
+                source_revision: "c".repeat(64),
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .expect("grant verifies against exact prompt scope");
         let section =
-            render_world_view_bindings_section(&state, &registry, &[(binding_id, Ok(resolved))]);
+            render_world_view_bindings_section(&state, &registry, &resolutions, &authority_grants);
 
-        assert!(section.contains("Authority: mutable hosted world available to this agent."));
+        assert!(section.contains(
+            "Authority: mutable hosted world available through a host-owned scoped command."
+        ));
         assert!(section.contains(
             "Command surface: run supplied commands through the Buzz workspace shell tool"
         ));
-        assert!(section.contains(
-            "World hosted command options: --base-url 'https://manifest.shivai.space' --edit-share-file '/credentials/hosted-1.edit-share' --anonymous-session"
-        ));
-        assert!(section.contains(
-            "Read current source: world hosted latest --json --base-url 'https://manifest.shivai.space' --edit-share-file '/credentials/hosted-1.edit-share' --anonymous-session"
-        ));
-        assert!(
-            section.contains("canonical `world hosted` read and mutation commands are available")
-        );
-        assert!(!section.contains("edit-token"));
+        assert!(section.contains(&format!(
+            "Mutation command: buzz world-views script --channel {CHANNEL_UUID} --binding {binding_id} --expected-revision {} --script - --grant {authority_grant}",
+            "c".repeat(64),
+        )));
+        assert!(section.contains("Buzz resolves private machine-local authority"));
+        assert!(section.contains("never request or print credentials"));
+        assert!(!section.contains(&credential_file.to_string_lossy().to_string()));
+        assert!(!section.contains("--edit-share"));
+        assert!(!section.contains("--base-url"));
+        assert!(!section.contains("world hosted"));
+        assert!(!section.contains("private-edit-share"));
+        std::fs::remove_dir_all(authority_root).expect("remove authority fixture root");
     }
 
     #[test]
