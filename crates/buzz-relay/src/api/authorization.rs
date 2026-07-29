@@ -31,6 +31,8 @@ const AUTHORIZATION_SCHEMA_VERSION: u8 = 1;
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthorizationCapability {
+    /// The caller is currently an active channel member.
+    AccessChannel,
     /// The caller currently holds the channel owner or admin role.
     ManageChannel,
 }
@@ -42,16 +44,25 @@ pub struct CheckCapabilityRequest {
     pub channel_id: Uuid,
     /// Side-effect-free capability requested by the caller.
     pub capability: AuthorizationCapability,
+    /// Optional exact thread root whose existence is checked inside the channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root_event_id: Option<String>,
 }
 
-/// Current channel roles that satisfy [`AuthorizationCapability::ManageChannel`].
+/// Current authoritative channel role returned by a successful capability check.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum ChannelManagementRole {
+pub enum ChannelRole {
     /// Current channel owner.
     Owner,
     /// Current channel administrator.
     Admin,
+    /// Current standard member.
+    Member,
+    /// Current read-only guest member.
+    Guest,
+    /// Current bot member.
+    Bot,
 }
 
 /// Successful current-authority readback.
@@ -68,7 +79,10 @@ pub struct CheckCapabilityResponse {
     /// Explicit allow decision.
     pub decision: CapabilityDecision,
     /// Current authoritative role that satisfied the capability.
-    pub role: ChannelManagementRole,
+    pub role: ChannelRole,
+    /// Exact thread root checked for an access capability, when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_root_event_id: Option<String>,
 }
 
 /// A successful response is always an explicit allow; denials use HTTP 403.
@@ -117,13 +131,43 @@ pub async fn check_capability(
         .await
         .map_err(|error| internal_error(&format!("current channel role lookup failed: {error}")))?;
 
-    let role = match (request.capability, current_role.as_deref()) {
-        (AuthorizationCapability::ManageChannel, Some("owner")) => ChannelManagementRole::Owner,
-        (AuthorizationCapability::ManageChannel, Some("admin")) => ChannelManagementRole::Admin,
+    let role = match current_role.as_deref() {
+        Some("owner") => ChannelRole::Owner,
+        Some("admin") => ChannelRole::Admin,
+        Some("member") => ChannelRole::Member,
+        Some("guest") => ChannelRole::Guest,
+        Some("bot") => ChannelRole::Bot,
         _ => {
             return Err(api_error(StatusCode::FORBIDDEN, "authorization denied"));
         }
     };
+    if request.capability == AuthorizationCapability::ManageChannel
+        && !matches!(role, ChannelRole::Owner | ChannelRole::Admin)
+    {
+        return Err(api_error(StatusCode::FORBIDDEN, "authorization denied"));
+    }
+
+    if let Some(thread_root_event_id) = request.thread_root_event_id.as_deref() {
+        let event_id = hex::decode(thread_root_event_id)
+            .ok()
+            .filter(|bytes| bytes.len() == 32)
+            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid thread root event id"))?;
+        let matching_events = state
+            .db
+            .query_events(&buzz_db::event::EventQuery {
+                channel_id: Some(request.channel_id),
+                ids: Some(vec![event_id]),
+                limit: Some(1),
+                ..buzz_db::event::EventQuery::for_community(tenant.community())
+            })
+            .await
+            .map_err(|error| {
+                internal_error(&format!("thread root existence lookup failed: {error}"))
+            })?;
+        if matching_events.is_empty() {
+            return Err(api_error(StatusCode::FORBIDDEN, "authorization denied"));
+        }
+    }
 
     Ok(Json(CheckCapabilityResponse {
         schema_version: AUTHORIZATION_SCHEMA_VERSION,
@@ -132,6 +176,7 @@ pub async fn check_capability(
         capability: request.capability,
         decision: CapabilityDecision::Allow,
         role,
+        thread_root_event_id: request.thread_root_event_id,
     }))
 }
 
@@ -284,16 +329,30 @@ mod tests {
     }
 
     #[test]
-    fn capability_contract_has_one_explicit_wire_value() {
-        let request = CheckCapabilityRequest {
+    fn capability_contract_has_explicit_wire_values() {
+        let manage = CheckCapabilityRequest {
             channel_id: Uuid::nil(),
             capability: AuthorizationCapability::ManageChannel,
+            thread_root_event_id: None,
         };
         assert_eq!(
-            serde_json::to_value(request).expect("serialize request"),
+            serde_json::to_value(manage).expect("serialize manage request"),
             serde_json::json!({
                 "channel_id": Uuid::nil(),
                 "capability": "manage-channel",
+            })
+        );
+        let access = CheckCapabilityRequest {
+            channel_id: Uuid::nil(),
+            capability: AuthorizationCapability::AccessChannel,
+            thread_root_event_id: Some("ab".repeat(32)),
+        };
+        assert_eq!(
+            serde_json::to_value(access).expect("serialize access request"),
+            serde_json::json!({
+                "channel_id": Uuid::nil(),
+                "capability": "access-channel",
+                "thread_root_event_id": "ab".repeat(32),
             })
         );
     }
@@ -344,9 +403,45 @@ mod tests {
             .await
             .expect("add second owner");
 
+        let outsider = Keys::generate();
+        let outsider_bytes = outsider.public_key().to_bytes();
+        state
+            .db
+            .ensure_user(community, &outsider_bytes)
+            .await
+            .expect("ensure prospective member");
+        let access_request = CheckCapabilityRequest {
+            channel_id: channel.id,
+            capability: AuthorizationCapability::AccessChannel,
+            thread_root_event_id: None,
+        };
+        let nonmember = post_capability(state.clone(), &host, &outsider, &access_request).await;
+        assert_eq!(nonmember.status(), StatusCode::FORBIDDEN);
+        state
+            .db
+            .add_member(
+                community,
+                channel.id,
+                &outsider_bytes,
+                buzz_db::channel::MemberRole::Guest,
+                Some(&owner_a_bytes),
+            )
+            .await
+            .expect("add guest member");
+        let current_member =
+            post_capability(state.clone(), &host, &outsider, &access_request).await;
+        assert_eq!(current_member.status(), StatusCode::OK);
+        let member_body = to_bytes(current_member.into_body(), 64 * 1024)
+            .await
+            .expect("read member response");
+        let member: CheckCapabilityResponse =
+            serde_json::from_slice(&member_body).expect("decode member response");
+        assert_eq!(member.role, ChannelRole::Guest);
+
         let request = CheckCapabilityRequest {
             channel_id: channel.id,
             capability: AuthorizationCapability::ManageChannel,
+            thread_root_event_id: None,
         };
         let allowed = post_capability(state.clone(), &host, &owner_a, &request).await;
         assert_eq!(allowed.status(), StatusCode::OK);
@@ -356,7 +451,7 @@ mod tests {
         let allowed: CheckCapabilityResponse =
             serde_json::from_slice(&allowed_body).expect("decode allowed response");
         assert_eq!(allowed.subject_pubkey, owner_a.public_key().to_hex());
-        assert_eq!(allowed.role, ChannelManagementRole::Owner);
+        assert_eq!(allowed.role, ChannelRole::Owner);
 
         let tenant = TenantContext::resolved(community, host.clone());
         crate::handlers::side_effects::emit_group_discovery_events(&tenant, &state, channel.id)
