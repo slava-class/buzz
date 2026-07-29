@@ -39,7 +39,10 @@ pub enum AuthorizationCapability {
 
 /// Request body for [`check_capability`].
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CheckCapabilityRequest {
+    /// Authorization request contract version.
+    pub schema_version: u8,
     /// Exact channel whose current role is checked.
     pub channel_id: Uuid,
     /// Side-effect-free capability requested by the caller.
@@ -47,6 +50,12 @@ pub struct CheckCapabilityRequest {
     /// Optional exact thread root whose existence is checked inside the channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_root_event_id: Option<String>,
+}
+
+fn is_supported_capability_request(request: &CheckCapabilityRequest) -> bool {
+    request.schema_version == AUTHORIZATION_SCHEMA_VERSION
+        && (request.capability != AuthorizationCapability::ManageChannel
+            || request.thread_root_event_id.is_none())
 }
 
 /// Current authoritative channel role returned by a successful capability check.
@@ -121,10 +130,21 @@ pub async fn check_capability(
         verify_bridge_auth_with_options(&headers, "POST", &url, Some(body.as_ref()), true, true)?;
     enforce_http_admission(&state, &tenant, &pubkey).await?;
     check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+    let subject = pubkey.to_bytes();
+    let auth_tag = headers
+        .get("x-auth-tag")
+        .and_then(|value| value.to_str().ok());
+    super::relay_members::enforce_relay_membership(&state, tenant.community(), &subject, auth_tag)
+        .await?;
 
     let request: CheckCapabilityRequest = serde_json::from_slice(&body)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid capability request"))?;
-    let subject = pubkey.to_bytes();
+    if !is_supported_capability_request(&request) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported capability request shape",
+        ));
+    }
     let current_role = state
         .db
         .get_member_role(tenant.community(), request.channel_id, &subject)
@@ -152,19 +172,32 @@ pub async fn check_capability(
             .ok()
             .filter(|bytes| bytes.len() == 32)
             .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid thread root event id"))?;
-        let matching_events = state
-            .db
-            .query_events(&buzz_db::event::EventQuery {
-                channel_id: Some(request.channel_id),
-                ids: Some(vec![event_id]),
-                limit: Some(1),
-                ..buzz_db::event::EventQuery::for_community(tenant.community())
+        let (event_result, metadata_result) = tokio::join!(
+            state.db.get_event_by_id(tenant.community(), &event_id),
+            state
+                .db
+                .get_thread_metadata_by_event(tenant.community(), &event_id),
+        );
+        let event = event_result
+            .map_err(|error| internal_error(&format!("thread root event lookup failed: {error}")))?
+            .ok_or_else(|| api_error(StatusCode::FORBIDDEN, "authorization denied"))?;
+        let metadata = metadata_result.map_err(|error| {
+            internal_error(&format!("thread root metadata lookup failed: {error}"))
+        })?;
+        let is_message_root = matches!(
+            u32::from(event.event.kind.as_u16()),
+            buzz_core::kind::KIND_STREAM_MESSAGE | buzz_core::kind::KIND_STREAM_MESSAGE_V2
+        );
+        let has_no_ancestry = metadata
+            .as_ref()
+            .map(|metadata| {
+                metadata.channel_id == request.channel_id
+                    && metadata.depth == 0
+                    && metadata.parent_event_id.is_none()
+                    && metadata.root_event_id.is_none()
             })
-            .await
-            .map_err(|error| {
-                internal_error(&format!("thread root existence lookup failed: {error}"))
-            })?;
-        if matching_events.is_empty() {
+            .unwrap_or(true);
+        if event.channel_id != Some(request.channel_id) || !is_message_root || !has_no_ancestry {
             return Err(api_error(StatusCode::FORBIDDEN, "authorization denied"));
         }
     }
@@ -190,7 +223,10 @@ mod tests {
     };
     use base64::Engine;
     use buzz_auth::Nip98ReplayGuard;
-    use buzz_core::{kind::KIND_NIP29_GROUP_ADMINS, TenantContext};
+    use buzz_core::{
+        kind::{KIND_NIP29_GROUP_ADMINS, KIND_STREAM_MESSAGE, KIND_SYSTEM_MESSAGE},
+        TenantContext,
+    };
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
@@ -236,7 +272,7 @@ mod tests {
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         config.relay_url = format!("wss://{host}");
         config.require_auth_token = true;
-        config.require_relay_membership = false;
+        config.require_relay_membership = true;
 
         let pool = sqlx::PgPool::connect(TEST_DB_URL).await.ok()?;
         let db = buzz_db::Db::from_pool(pool.clone());
@@ -300,6 +336,24 @@ mod tests {
             .expect("response")
     }
 
+    fn signed_event(keys: &Keys, kind: Kind, content: &str) -> nostr::Event {
+        EventBuilder::new(kind, content)
+            .sign_with_keys(keys)
+            .expect("sign event")
+    }
+
+    fn access_request_for_root(
+        channel_id: Uuid,
+        thread_root_event: &nostr::Event,
+    ) -> CheckCapabilityRequest {
+        CheckCapabilityRequest {
+            schema_version: AUTHORIZATION_SCHEMA_VERSION,
+            channel_id,
+            capability: AuthorizationCapability::AccessChannel,
+            thread_root_event_id: Some(thread_root_event.id.to_hex()),
+        }
+    }
+
     async fn latest_admin_projection(
         state: &AppState,
         community: buzz_core::CommunityId,
@@ -331,6 +385,7 @@ mod tests {
     #[test]
     fn capability_contract_has_explicit_wire_values() {
         let manage = CheckCapabilityRequest {
+            schema_version: AUTHORIZATION_SCHEMA_VERSION,
             channel_id: Uuid::nil(),
             capability: AuthorizationCapability::ManageChannel,
             thread_root_event_id: None,
@@ -338,11 +393,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(manage).expect("serialize manage request"),
             serde_json::json!({
+                "schema_version": AUTHORIZATION_SCHEMA_VERSION,
                 "channel_id": Uuid::nil(),
                 "capability": "manage-channel",
             })
         );
         let access = CheckCapabilityRequest {
+            schema_version: AUTHORIZATION_SCHEMA_VERSION,
             channel_id: Uuid::nil(),
             capability: AuthorizationCapability::AccessChannel,
             thread_root_event_id: Some("ab".repeat(32)),
@@ -350,11 +407,33 @@ mod tests {
         assert_eq!(
             serde_json::to_value(access).expect("serialize access request"),
             serde_json::json!({
+                "schema_version": AUTHORIZATION_SCHEMA_VERSION,
                 "channel_id": Uuid::nil(),
                 "capability": "access-channel",
                 "thread_root_event_id": "ab".repeat(32),
             })
         );
+        assert!(
+            serde_json::from_value::<CheckCapabilityRequest>(serde_json::json!({
+                "schema_version": AUTHORIZATION_SCHEMA_VERSION,
+                "channel_id": Uuid::nil(),
+                "capability": "access-channel",
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(!is_supported_capability_request(&CheckCapabilityRequest {
+            schema_version: AUTHORIZATION_SCHEMA_VERSION + 1,
+            channel_id: Uuid::nil(),
+            capability: AuthorizationCapability::AccessChannel,
+            thread_root_event_id: None,
+        }));
+        assert!(!is_supported_capability_request(&CheckCapabilityRequest {
+            schema_version: AUTHORIZATION_SCHEMA_VERSION,
+            channel_id: Uuid::nil(),
+            capability: AuthorizationCapability::ManageChannel,
+            thread_root_event_id: Some("ab".repeat(32)),
+        }));
     }
 
     #[tokio::test]
@@ -373,6 +452,11 @@ mod tests {
             .ensure_user(community, &owner_a_bytes)
             .await
             .expect("ensure first owner");
+        assert!(state
+            .db
+            .add_relay_member(community, &owner_a.public_key().to_hex(), "member", None,)
+            .await
+            .expect("add first owner to closed relay"));
         state
             .db
             .ensure_user(community, &owner_b_bytes)
@@ -410,7 +494,13 @@ mod tests {
             .ensure_user(community, &outsider_bytes)
             .await
             .expect("ensure prospective member");
+        assert!(state
+            .db
+            .add_relay_member(community, &outsider.public_key().to_hex(), "member", None,)
+            .await
+            .expect("add prospective member to closed relay"));
         let access_request = CheckCapabilityRequest {
+            schema_version: AUTHORIZATION_SCHEMA_VERSION,
             channel_id: channel.id,
             capability: AuthorizationCapability::AccessChannel,
             thread_root_event_id: None,
@@ -438,7 +528,29 @@ mod tests {
             serde_json::from_slice(&member_body).expect("decode member response");
         assert_eq!(member.role, ChannelRole::Guest);
 
+        assert_eq!(
+            state
+                .db
+                .remove_relay_member(community, &outsider.public_key().to_hex())
+                .await
+                .expect("remove guest from closed relay"),
+            buzz_db::relay_members::RemoveResult::Removed
+        );
+        assert_eq!(
+            state
+                .db
+                .get_member_role(community, channel.id, &outsider_bytes)
+                .await
+                .expect("read retained channel membership")
+                .as_deref(),
+            Some("guest")
+        );
+        let removed_relay_member =
+            post_capability(state.clone(), &host, &outsider, &access_request).await;
+        assert_eq!(removed_relay_member.status(), StatusCode::FORBIDDEN);
+
         let request = CheckCapabilityRequest {
+            schema_version: AUTHORIZATION_SCHEMA_VERSION,
             channel_id: channel.id,
             capability: AuthorizationCapability::ManageChannel,
             thread_root_event_id: None,
@@ -487,5 +599,172 @@ mod tests {
 
         let denied = post_capability(state, &host, &owner_a, &request).await;
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn capability_accepts_only_live_top_level_message_roots_in_the_requested_channel() {
+        let host = format!("capability-root-test-{}.local", Uuid::new_v4().simple());
+        let (state, community) = test_state(&host)
+            .await
+            .expect("local Postgres and Redis must be reachable");
+        let member = Keys::generate();
+        let member_bytes = member.public_key().to_bytes();
+        state
+            .db
+            .ensure_user(community, &member_bytes)
+            .await
+            .expect("ensure member");
+        assert!(state
+            .db
+            .add_relay_member(community, &member.public_key().to_hex(), "member", None,)
+            .await
+            .expect("add member to closed relay"));
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "capability-root-test",
+                buzz_db::channel::ChannelType::Stream,
+                buzz_db::channel::ChannelVisibility::Open,
+                None,
+                &member_bytes,
+                None,
+            )
+            .await
+            .expect("create requested channel");
+        let other_channel = state
+            .db
+            .create_channel(
+                community,
+                "capability-root-test-other",
+                buzz_db::channel::ChannelType::Stream,
+                buzz_db::channel::ChannelVisibility::Open,
+                None,
+                &member_bytes,
+                None,
+            )
+            .await
+            .expect("create other channel");
+
+        let root = signed_event(
+            &member,
+            Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            "valid root",
+        );
+        state
+            .db
+            .insert_event_with_thread_metadata(community, &root, Some(channel.id), None)
+            .await
+            .expect("insert valid root");
+        let valid = post_capability(
+            state.clone(),
+            &host,
+            &member,
+            &access_request_for_root(channel.id, &root),
+        )
+        .await;
+        assert_eq!(valid.status(), StatusCode::OK);
+
+        let reply = signed_event(&member, Kind::Custom(KIND_STREAM_MESSAGE as u16), "reply");
+        let root_created_at = chrono::DateTime::from_timestamp(root.created_at.as_secs() as i64, 0)
+            .expect("valid root timestamp");
+        let reply_created_at =
+            chrono::DateTime::from_timestamp(reply.created_at.as_secs() as i64, 0)
+                .expect("valid reply timestamp");
+        state
+            .db
+            .insert_event_with_thread_metadata(
+                community,
+                &reply,
+                Some(channel.id),
+                Some(buzz_db::event::ThreadMetadataParams {
+                    event_id: reply.id.as_bytes(),
+                    event_created_at: reply_created_at,
+                    channel_id: channel.id,
+                    parent_event_id: Some(root.id.as_bytes()),
+                    parent_event_created_at: Some(root_created_at),
+                    root_event_id: Some(root.id.as_bytes()),
+                    root_event_created_at: Some(root_created_at),
+                    depth: 1,
+                    broadcast: false,
+                }),
+            )
+            .await
+            .expect("insert reply");
+
+        let reaction = signed_event(&member, Kind::Reaction, "reaction");
+        state
+            .db
+            .insert_event_with_thread_metadata(community, &reaction, Some(channel.id), None)
+            .await
+            .expect("insert reaction");
+        let system_event = signed_event(
+            &member,
+            Kind::Custom(KIND_SYSTEM_MESSAGE as u16),
+            "system event",
+        );
+        state
+            .db
+            .insert_event_with_thread_metadata(community, &system_event, Some(channel.id), None)
+            .await
+            .expect("insert system event");
+        let wrong_channel_root = signed_event(
+            &member,
+            Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            "wrong channel root",
+        );
+        state
+            .db
+            .insert_event_with_thread_metadata(
+                community,
+                &wrong_channel_root,
+                Some(other_channel.id),
+                None,
+            )
+            .await
+            .expect("insert wrong-channel root");
+        let deleted_root = signed_event(
+            &member,
+            Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            "deleted root",
+        );
+        state
+            .db
+            .insert_event_with_thread_metadata(community, &deleted_root, Some(channel.id), None)
+            .await
+            .expect("insert root to delete");
+        assert!(state
+            .db
+            .soft_delete_event(community, deleted_root.id.as_bytes())
+            .await
+            .expect("soft-delete root"));
+        let nonexistent_root = signed_event(
+            &member,
+            Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            "never inserted",
+        );
+
+        for (case, denied_root) in [
+            ("reply", &reply),
+            ("reaction", &reaction),
+            ("system event", &system_event),
+            ("wrong-channel root", &wrong_channel_root),
+            ("deleted root", &deleted_root),
+            ("nonexistent root", &nonexistent_root),
+        ] {
+            let denied = post_capability(
+                state.clone(),
+                &host,
+                &member,
+                &access_request_for_root(channel.id, denied_root),
+            )
+            .await;
+            assert_eq!(
+                denied.status(),
+                StatusCode::FORBIDDEN,
+                "{case} must not be accepted as a thread root"
+            );
+        }
     }
 }
