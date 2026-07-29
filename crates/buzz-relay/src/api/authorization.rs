@@ -184,10 +184,8 @@ pub async fn check_capability(
         let metadata = metadata_result.map_err(|error| {
             internal_error(&format!("thread root metadata lookup failed: {error}"))
         })?;
-        let is_message_root = matches!(
-            u32::from(event.event.kind.as_u16()),
-            buzz_core::kind::KIND_STREAM_MESSAGE | buzz_core::kind::KIND_STREAM_MESSAGE_V2
-        );
+        let is_message_root =
+            buzz_core::kind::is_thread_root_kind(u32::from(event.event.kind.as_u16()));
         let has_no_ancestry = metadata
             .as_ref()
             .map(|metadata| {
@@ -224,7 +222,9 @@ mod tests {
     use base64::Engine;
     use buzz_auth::Nip98ReplayGuard;
     use buzz_core::{
-        kind::{KIND_NIP29_GROUP_ADMINS, KIND_STREAM_MESSAGE, KIND_SYSTEM_MESSAGE},
+        kind::{
+            KIND_FORUM_POST, KIND_NIP29_GROUP_ADMINS, KIND_STREAM_MESSAGE, KIND_SYSTEM_MESSAGE,
+        },
         TenantContext,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
@@ -603,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres and Redis"]
-    async fn capability_accepts_only_live_top_level_message_roots_in_the_requested_channel() {
+    async fn capability_accepts_only_live_canonical_roots_in_the_requested_channel() {
         let host = format!("capability-root-test-{}.local", Uuid::new_v4().simple());
         let (state, community) = test_state(&host)
             .await
@@ -665,6 +665,25 @@ mod tests {
         )
         .await;
         assert_eq!(valid.status(), StatusCode::OK);
+
+        let forum_root = signed_event(
+            &member,
+            Kind::Custom(KIND_FORUM_POST as u16),
+            "valid forum root",
+        );
+        state
+            .db
+            .insert_event_with_thread_metadata(community, &forum_root, Some(channel.id), None)
+            .await
+            .expect("insert valid forum root");
+        let valid_forum = post_capability(
+            state.clone(),
+            &host,
+            &member,
+            &access_request_for_root(channel.id, &forum_root),
+        )
+        .await;
+        assert_eq!(valid_forum.status(), StatusCode::OK);
 
         let reply = signed_event(&member, Kind::Custom(KIND_STREAM_MESSAGE as u16), "reply");
         let root_created_at = chrono::DateTime::from_timestamp(root.created_at.as_secs() as i64, 0)

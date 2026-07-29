@@ -712,6 +712,14 @@ pub const fn is_parameterized_replaceable(kind: u32) -> bool {
     kind >= PARAM_REPLACEABLE_KIND_MIN && kind <= PARAM_REPLACEABLE_KIND_MAX
 }
 
+/// Returns `true` when a stored channel event can be a canonical thread root.
+pub const fn is_thread_root_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        KIND_STREAM_MESSAGE | KIND_STREAM_MESSAGE_V2 | KIND_FORUM_POST
+    )
+}
+
 /// Returns `true` if `kind` is a workflow execution event (46001–46012).
 /// These must not trigger workflows (prevents infinite loops).
 pub const fn is_workflow_execution_kind(kind: u32) -> bool {
@@ -830,6 +838,16 @@ mod tests {
         for &k in ALL_KINDS {
             assert!(seen.insert(k), "duplicate kind value: {k}");
         }
+    }
+
+    #[test]
+    fn canonical_thread_root_kinds_exclude_replies_and_system_events() {
+        assert!(is_thread_root_kind(KIND_STREAM_MESSAGE));
+        assert!(is_thread_root_kind(KIND_STREAM_MESSAGE_V2));
+        assert!(is_thread_root_kind(KIND_FORUM_POST));
+        assert!(!is_thread_root_kind(KIND_FORUM_COMMENT));
+        assert!(!is_thread_root_kind(KIND_REACTION));
+        assert!(!is_thread_root_kind(KIND_SYSTEM_MESSAGE));
     }
 
     #[test]
